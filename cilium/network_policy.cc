@@ -22,6 +22,7 @@
 #include "envoy/config/core/v3/address.pb.h"
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/config/core/v3/config_source.pb.h"
+#include "envoy/config/grpc_mux.h"
 #include "envoy/config/subscription.h"
 #include "envoy/event/dispatcher_thread_deletable.h"
 #include "envoy/http/header_map.h"
@@ -49,7 +50,6 @@
 #include "source/common/network/utility.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
-#include "source/extensions/config_subscription/grpc/grpc_subscription_impl.h"
 #include "source/server/transport_socket_config_impl.h"
 
 #include "absl/container/btree_map.h"
@@ -127,32 +127,44 @@ class PolicyInstanceImpl;
 using PolicyMapSnapshot =
     absl::flat_hash_map<std::string, std::shared_ptr<const PolicyInstanceImpl>>;
 
+// PolicyStreamState is shared by all policies created from one accepted NPDS stream generation.
+class PolicyStreamState {
+public:
+  explicit PolicyStreamState(uint64_t stream_generation) : stream_generation_(stream_generation) {}
+
+  uint64_t streamGeneration() const { return stream_generation_; }
+
+private:
+  const uint64_t stream_generation_;
+};
+using PolicyStreamStateSharedPtr = std::shared_ptr<PolicyStreamState>;
+using PolicyStreamStateConstSharedPtr = std::shared_ptr<const PolicyStreamState>;
+
 class NetworkPolicyMapImpl : public Envoy::Config::SubscriptionCallbacks,
                              public Envoy::Event::DispatcherThreadDeletable,
-                             public Logger::Loggable<Logger::Id::config> {
+                             public Logger::Loggable<Logger::Id::config>,
+                             public std::enable_shared_from_this<NetworkPolicyMapImpl> {
 public:
   NetworkPolicyMapImpl(Server::Configuration::FactoryContext& context,
                        const envoy::config::core::v3::ConfigSource& config_source);
   ~NetworkPolicyMapImpl() override;
 
   void startSubscription(const envoy::config::core::v3::ConfigSource& config_source) {
-    if (config_source.config_source_specifier_case() ==
-        envoy::config::core::v3::ConfigSource::kAds) {
-      auto ads_mux = context_.xdsManager().adsMux();
-      subscription_ = THROW_OR_RETURN_VALUE(
-          context_.clusterManager().subscriptionFactory().subscriptionOverAdsGrpcMux(
-              ads_mux, config_source, NetworkPolicyTypeUrl, *npds_stats_scope_, *this,
-              std::make_shared<NetworkPolicyDecoder>(), {}),
-          Config::SubscriptionPtr);
-    } else {
-      subscription_ = subscribe(NetworkPolicyTypeUrl, config_source, context_, *npds_stats_scope_,
-                                *this, std::make_shared<NetworkPolicyDecoder>());
-    }
+    const uint64_t subscription_id = ++subscription_id_;
+    subscription_ = subscribe(
+        NetworkPolicyTypeUrl, config_source, context_, *npds_stats_scope_, *this,
+        std::make_shared<NetworkPolicyDecoder>(),
+        [weak_this = weak_from_this(), subscription_id](Config::GrpcMuxStreamEvent event) {
+          if (auto shared_this = weak_this.lock()) {
+            shared_this->onSubscriptionStreamEvent(subscription_id, event);
+          }
+        });
   }
 
   // This is used for testing with a file-based subscription
   void startSubscription(std::unique_ptr<Envoy::Config::Subscription>&& subscription) {
     subscription_ = std::move(subscription);
+    subscription_connected_ = false; // XXX
   }
 
   const envoy::config::core::v3::ConfigSource& getConfigSource() const { return config_source_; }
@@ -181,19 +193,8 @@ public:
   void tlsWrapperMissingPolicyInc() const { stats_.tls_wrapper_missing_policy_.inc(); }
 
 protected:
-  bool isNewStream() const {
-    auto sub = dynamic_cast<Config::GrpcSubscriptionImpl*>(subscription_.get());
-    if (!sub) {
-      ENVOY_LOG(error, "Cilium NetworkPolicyMapImpl: Cannot get GrpcSubscriptionImpl");
-      return false;
-    }
-    auto mux = dynamic_cast<GrpcMuxImpl*>(sub->grpcMux().get());
-    if (!mux) {
-      ENVOY_LOG(error, "Cilium NetworkPolicyMapImpl: Cannot get GrpcMuxImpl");
-      return false;
-    }
-    return mux->isNewStream();
-  }
+  uint64_t streamGeneration() const { return subscription_stream_generation_; }
+  void resetStreamForTest() { subscription_stream_generation_++; }
 
   // run the given function after all the threads have scheduled
   void runAfterAllThreads(std::function<void()> cb) const {
@@ -214,9 +215,43 @@ protected:
   createOrReusePolicy(const cilium::NetworkPolicy& config, const PolicyMapSnapshot& old_policy_map);
 
   void installNewPolicyMap(PolicyMapSnapshot&& new_policy_map,
-                           Init::ManagerImpl& version_init_manager, std::string&& version_name);
+                           Init::ManagerImpl& version_init_manager, std::string&& version_name,
+                           const PolicyStreamStateSharedPtr& policy_stream_state);
 
 private:
+  void onSubscriptionStreamEvent(uint64_t subscription_id, Config::GrpcMuxStreamEvent event) {
+    // skip stale notifications for earlier subscriptions
+    if (subscription_id != subscription_id_) {
+      return;
+    }
+    switch (event) {
+    case Config::GrpcMuxStreamEvent::Established:
+      ++subscription_stream_generation_;
+      subscription_connected_ = true;
+      break;
+    case Config::GrpcMuxStreamEvent::Closed:
+      if (!subscription_connected_) {
+        return;
+      }
+      subscription_connected_ = false;
+
+      // The close callback runs on the subscription object's own stack, so defer any possible
+      // recreation until after it unwinds to avoid destroying the current subscription
+      // mid-callback.
+      context_.mainThreadDispatcher().post(
+          [weak_this = weak_from_this(), subscription_id = subscription_id_]() {
+            if (auto shared_this = weak_this.lock()) {
+              // skip stale callbacks for earlier subscriptions
+              if (subscription_id != shared_this->subscription_id_) {
+                return;
+              }
+              // shared_this->maybeRecreateSubscriptionInDesiredMode(/*transport_closed=*/true);
+            }
+          });
+      break;
+    }
+  }
+
   // Helpers for atomic swap of the policy map pointer.
   //
   // store() is only used for the initialization of the map during construction.
@@ -260,8 +295,12 @@ private:
 
   static uint64_t instance_id_;
 
+  bool subscription_connected_{false};
+  uint64_t subscription_id_{0};
   Server::Configuration::ServerFactoryContext& context_;
   std::atomic<const PolicyMapSnapshot*> map_ptr_;
+  // Policies hold a shared per-stream state object.
+  PolicyStreamStateSharedPtr policy_stream_state_{std::make_shared<PolicyStreamState>(0)};
   Stats::ScopeSharedPtr npds_stats_scope_;
   Stats::ScopeSharedPtr policy_stats_scope_;
 
@@ -276,6 +315,7 @@ private:
 
   envoy::config::core::v3::ConfigSource config_source_;
   std::unique_ptr<Envoy::Config::Subscription> subscription_;
+  static uint64_t subscription_stream_generation_;
 
   ProtobufTypes::MessagePtr dumpNetworkPolicyConfigs(const Matchers::StringMatcher& name_matcher);
   Server::ConfigTracker::EntryOwnerPtr config_tracker_entry_;
@@ -287,6 +327,7 @@ protected:
 };
 
 uint64_t NetworkPolicyMapImpl::instance_id_ = 0;
+uint64_t NetworkPolicyMapImpl::subscription_stream_generation_ = 1;
 
 IpAddressPair::IpAddressPair(const cilium::NetworkPolicy& proto) {
   for (const auto& ip_addr : proto.endpoint_ips()) {
@@ -1691,8 +1732,7 @@ NetworkPolicyMap::~NetworkPolicyMap() {
   ENVOY_LOG(debug,
             "Cilium L7 NetworkPolicyMap: posting NetworkPolicyMapImpl deletion to main thread");
 
-  context_.mainThreadDispatcher().deleteInDispatcherThread(
-      Event::DispatcherThreadDeletableConstPtr(impl_.release()));
+  context_.mainThreadDispatcher().post([impl = std::move(impl_)]() mutable { impl.reset(); });
 }
 
 bool NetworkPolicyMap::exists(const std::string& endpoint_policy_name) const {
@@ -1728,7 +1768,8 @@ NetworkPolicyMapImpl::NetworkPolicyMapImpl(
               context_.messageValidationContext().dynamicValidationVisitor())),
       parked_init_manager_(std::make_unique<Init::ManagerImpl>("Cilium NetworkPolicyMap parked")),
       config_source_(config_source),
-      stats_{ALL_CILIUM_POLICY_STATS(POOL_COUNTER(*policy_stats_scope_))} {
+      stats_{ALL_CILIUM_POLICY_COUNTERS(POOL_COUNTER(*policy_stats_scope_))
+                 ALL_CILIUM_POLICY_GAUGES(POOL_GAUGE(*policy_stats_scope_))} {
   // Use listener init manager for subscription initialization
   context.initManager().add(init_target_);
   transport_factory_context_->setInitManager(*parked_init_manager_);
@@ -1783,13 +1824,18 @@ NetworkPolicyMapImpl::createOrReusePolicy(const cilium::NetworkPolicy& config,
   return std::make_shared<const PolicyInstanceImpl>(*this, new_hash, config);
 }
 
-void NetworkPolicyMapImpl::installNewPolicyMap(PolicyMapSnapshot&& new_policy_map,
-                                               Init::ManagerImpl& version_init_manager,
-                                               std::string&& version_name) {
+void NetworkPolicyMapImpl::installNewPolicyMap(
+    PolicyMapSnapshot&& new_policy_map, Init::ManagerImpl& version_init_manager,
+    std::string&& version_name, const PolicyStreamStateSharedPtr& policy_stream_state) {
   // Initialize SDS secrets. We do not wait for the completion.
   version_init_manager.initialize(Init::WatcherImpl(std::move(version_name), []() {}));
 
   const auto* old_policy_map = exchange(new PolicyMapSnapshot(std::move(new_policy_map)));
+
+  // Record stream state only after a successful install. The reserved value 0
+  // keeps the initial accepted update on any stream source classified as new.
+  policy_stream_state_ = policy_stream_state;
+  stats_.policy_stream_generation_.set(policy_stream_state_->streamGeneration());
 
   // Delete the old map once all worker threads have entered their event queues, as this
   // is proof that they no longer refer to the old map.
@@ -1846,15 +1892,20 @@ void NetworkPolicyMapImpl::removeInitManager() {
 absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     const std::vector<Envoy::Config::DecodedResourceRef>& resources,
     const std::string& version_info) {
-  ENVOY_LOG(debug, "NetworkPolicyMapImpl::onConfigUpdate({}), {} resources, version: {}",
-            instance_id_, resources.size(), version_info);
+  subscription_connected_ = true;
+  auto stream_generation = streamGeneration();
+  // policy_stream_state_ gets updated on first successful update,
+  // so 'is_new_stream' remains 'true' as long as the stream has not had a successful update yet.
+  const bool is_new_stream = stream_generation != policy_stream_state_->streamGeneration();
+  ENVOY_LOG(debug, "NetworkPolicyMapImpl::onConfigUpdate({}), {} resources, version: {}, stream {}",
+            instance_id_, resources.size(), version_info, stream_generation);
   stats_.updates_total_.inc();
 
   // Reopen IPcache for every new stream. Cilium agent re-creates IP cache on restart,
   // and that is also when the old stream terminates and a new one is created.
   // New security identities (e.g., for FQDN policies) only get inserted to the new IP cache,
   // so open it before the workers get a chance to enforce policy on the new IDs.
-  if (isNewStream()) {
+  if (is_new_stream) {
     ENVOY_LOG(info, "New NetworkPolicy stream");
 
     reopenIpcache();
@@ -1867,6 +1918,8 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   // SDS secrets will use this!
   transport_factory_context_->setInitManager(version_init_manager);
 
+  const auto policy_stream_state =
+      is_new_stream ? std::make_shared<PolicyStreamState>(stream_generation) : policy_stream_state_;
   const auto* old_policy_map = load();
   PolicyMapSnapshot new_policy_map;
   try {
@@ -1895,8 +1948,9 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   }
 
   stats_.update_success_.inc();
-  removeInitManager();
-  installNewPolicyMap(std::move(new_policy_map), version_init_manager, std::move(version_name));
+
+  installNewPolicyMap(std::move(new_policy_map), version_init_manager, std::move(version_name),
+                      policy_stream_state);
 
   return absl::OkStatus();
 }

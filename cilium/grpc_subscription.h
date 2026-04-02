@@ -1,43 +1,17 @@
 #pragma once
 
-#include <chrono>
 #include <memory>
 
 #include "envoy/config/core/v3/config_source.pb.h"
+#include "envoy/config/grpc_mux.h"
 #include "envoy/config/subscription.h"
-#include "envoy/server/factory_context.h"
+#include "envoy/ssl/context_manager.h"
 #include "envoy/stats/scope.h"
-
-#include "source/extensions/config_subscription/grpc/grpc_mux_context.h"
-#include "source/extensions/config_subscription/grpc/grpc_mux_impl.h"
 
 #include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Cilium {
-
-// GrpcMux wrapper to get access to control plane identifier
-class GrpcMuxImpl : public Config::GrpcMuxImpl {
-public:
-  GrpcMuxImpl(Config::GrpcMuxContext& grpc_mux_context) : Config::GrpcMuxImpl(grpc_mux_context) {}
-
-  ~GrpcMuxImpl() override = default;
-
-  void onStreamEstablished() override {
-    new_stream_ = true;
-    Config::GrpcMuxImpl::onStreamEstablished();
-  }
-
-  // isNewStream returns true for the first call after a new stream has been established
-  bool isNewStream() {
-    bool new_stream = new_stream_;
-    new_stream_ = false;
-    return new_stream;
-  }
-
-private:
-  bool new_stream_ = true;
-};
 
 std::unique_ptr<Config::Subscription>
 subscribe(const absl::string_view type_url,
@@ -45,7 +19,6 @@ subscribe(const absl::string_view type_url,
           Server::Configuration::CommonFactoryContext& context, Stats::Scope& scope,
           Config::SubscriptionCallbacks& callbacks,
           Config::OpaqueResourceDecoderSharedPtr resource_decoder,
-          std::chrono::milliseconds init_fetch_timeout = std::chrono::milliseconds(0));
-
+          Config::GrpcMuxStreamEventCallback on_stream_event = {});
 } // namespace Cilium
 } // namespace Envoy
