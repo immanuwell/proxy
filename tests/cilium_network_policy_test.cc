@@ -3,10 +3,12 @@
 #include <gtest/gtest.h>
 #include <spdlog/common.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "envoy/common/exception.h"
 #include "envoy/common/optref.h"
@@ -33,6 +35,7 @@
 #include "test/mocks/server/factory_context.h"
 #include "test/test_common/utility.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/strings/string_view.h"
 #include "cilium/accesslog.h"
 #include "cilium/network_policy.h"
@@ -71,6 +74,42 @@ extern const envoy::config::core::v3::ConfigSource CILIUM_XDS_API_CONFIG;
         return secret_provider;                                                                    \
       }))
 
+namespace {
+
+envoy::config::core::v3::ConfigSource configSourceForUseDeltaXds(bool use_delta_xds) {
+  auto config_source = CILIUM_XDS_API_CONFIG;
+  config_source.mutable_api_config_source()->set_api_type(
+      use_delta_xds ? envoy::config::core::v3::ApiConfigSource::DELTA_GRPC
+                    : envoy::config::core::v3::ApiConfigSource::GRPC);
+  return config_source;
+}
+
+struct FakeSubscriptionState {
+  int start_calls_{0};
+  std::vector<std::vector<std::string>> start_resources_;
+};
+
+class FakeSubscription : public Envoy::Config::Subscription {
+public:
+  explicit FakeSubscription(std::shared_ptr<FakeSubscriptionState> state)
+      : state_(std::move(state)) {}
+
+  void start(const absl::flat_hash_set<std::string>& resource_names) override {
+    ++state_->start_calls_;
+    auto& started = state_->start_resources_.emplace_back();
+    started.insert(started.end(), resource_names.begin(), resource_names.end());
+    std::sort(started.begin(), started.end());
+  }
+
+  void updateResourceInterest(const absl::flat_hash_set<std::string>&) override {}
+  void requestOnDemandUpdate(const absl::flat_hash_set<std::string>&) override {}
+
+private:
+  std::shared_ptr<FakeSubscriptionState> state_;
+};
+
+} // namespace
+
 class CiliumNetworkPolicyTest : public ::testing::Test {
 protected:
   CiliumNetworkPolicyTest() {
@@ -92,14 +131,18 @@ protected:
     ON_CALL_SDS_SECRET_PROVIDER(secret_manager_, TlsSessionTicketKeysContext, TlsSessionTicketKeys);
     ON_CALL_SDS_SECRET_PROVIDER(secret_manager_, GenericSecret, GenericSecret);
 
-    policy_map_ =
-        std::make_shared<NetworkPolicyMap>(factory_context_, Cilium::CILIUM_XDS_API_CONFIG);
+    bool use_delta = useDeltaXds();
+    bool use_nprds = use_delta;
+    policy_map_ = std::make_shared<NetworkPolicyMap>(factory_context_, use_nprds,
+                                                     configSourceForUseDeltaXds(use_delta));
   }
 
   void TearDown() override {
     ASSERT(policy_map_.use_count() == 1);
     policy_map_.reset();
   }
+
+  virtual bool useDeltaXds() const { return false; }
 
   Envoy::Config::SubscriptionCallbacks& subscriptionCallbacks() const {
     return policy_map_->subscriptionCallbacksForTest();
@@ -118,6 +161,23 @@ protected:
                     .onConfigUpdate(decoded_resources->refvec_, message.version_info())
                     .ok());
     return message.version_info();
+  }
+
+  std::string deltaUpdateFromYaml(const std::string& config) {
+    envoy::service::discovery::v3::DeltaDiscoveryResponse message;
+    MessageUtil::loadFromYaml(config, message, ProtobufMessage::getNullValidationVisitor());
+    NetworkPolicyResourceDecoder network_policy_resource_decoder;
+    auto decoded_resources = std::make_unique<Config::DecodedResourcesWrapper>();
+    for (const auto& resource : message.resources()) {
+      decoded_resources->pushBack(
+          Config::DecodedResourceImpl::fromResource(network_policy_resource_decoder, resource));
+    }
+
+    EXPECT_TRUE(subscriptionCallbacks()
+                    .onConfigUpdate(decoded_resources->refvec_, message.removed_resources(),
+                                    message.system_version_info())
+                    .ok());
+    return message.system_version_info();
   }
 
   testing::AssertionResult validate(const std::string& pod_ip, const std::string& expected) {
@@ -239,6 +299,34 @@ protected:
     return policy_map_->statsForTest().updates_rejected_.name();
   }
 
+  PolicyInstanceConstSharedPtr policyInstanceShared(const std::string& pod_ip) const {
+    return policy_map_->getPolicyInstanceSharedForTest(pod_ip);
+  }
+
+  uint64_t selectorStreamGenerationForTest(const PolicyInstance& policy) const {
+    return policy_map_->policySelectorStreamGenerationForTest(policy);
+  }
+
+  SelectorVersion selectorVersionForTest(const PolicyInstance& policy) const {
+    return policy_map_->policySelectorVersionForTest(policy);
+  }
+
+  void resetStreamForTest() { policy_map_->resetStreamForTest(); }
+  bool configuredUseDeltaXds() const { return policy_map_->desiredUseDeltaXdsForTest(); }
+  void setPolicyConfig(bool use_delta_xds, bool use_nprds) const {
+    policy_map_->setConfig(use_nprds, configSourceForUseDeltaXds(use_delta_xds));
+  }
+  void startManagedSubscriptionForTest() { policy_map_->startManagedSubscriptionForTest(); }
+  void setSubscriptionFactoryForTest(NetworkPolicyMap::SubscriptionFactoryForTest factory) {
+    policy_map_->setSubscriptionFactoryForTest(std::move(factory));
+  }
+  void onSubscriptionConnectedForTest() { policy_map_->onSubscriptionConnectedForTest(); }
+  void onSubscriptionTransportCloseForTest() { policy_map_->onSubscriptionTransportCloseForTest(); }
+  bool subscriptionUseDeltaXdsForTest() const {
+    return policy_map_->subscriptionUseDeltaXdsForTest();
+  }
+  bool subscriptionConnectedForTest() const { return policy_map_->subscriptionConnectedForTest(); }
+
   NiceMock<Server::Configuration::MockFactoryContext> factory_context_;
   NiceMock<Secret::MockSecretManager> secret_manager_;
   std::shared_ptr<NetworkPolicyMap> policy_map_;
@@ -246,8 +334,377 @@ protected:
   uint16_t proxy_id_ = 42;
 };
 
+class CiliumNetworkPolicyDeltaTest : public CiliumNetworkPolicyTest {
+protected:
+  bool useDeltaXds() const override { return true; }
+};
+
 TEST_F(CiliumNetworkPolicyTest, UpdatesRejectedStatName) {
   EXPECT_EQ("cilium.policy.updates_rejected", updatesRejectedStatName());
+}
+
+TEST_F(CiliumNetworkPolicyTest, ManagedSubscriptionColdStartUsesConfiguredSotwMode) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+
+  ASSERT_EQ(created_modes.size(), 1);
+  EXPECT_FALSE(created_modes.front());
+  EXPECT_FALSE(configuredUseDeltaXds());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  ASSERT_EQ(state->start_calls_, 1);
+  EXPECT_TRUE(state->start_resources_.front().empty());
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, ManagedSubscriptionColdStartUsesConfiguredDeltaMode) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+
+  ASSERT_EQ(created_modes.size(), 1);
+  EXPECT_TRUE(created_modes.front());
+  EXPECT_TRUE(configuredUseDeltaXds());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  ASSERT_EQ(state->start_calls_, 1);
+  EXPECT_TRUE(state->start_resources_.front().empty());
+}
+
+TEST_F(CiliumNetworkPolicyTest, FlagFlipFromSotwToDeltaOnHealthySubscriptionRecreatesImmediately) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+
+  setPolicyConfig(true, true);
+
+  EXPECT_TRUE(configuredUseDeltaXds());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_TRUE(state->start_resources_.back().empty());
+}
+
+TEST_F(CiliumNetworkPolicyTest, FlagFlipFromDeltaToSotwOnHealthySubscriptionWaitsForClose) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+  ASSERT_FALSE(subscriptionUseDeltaXdsForTest());
+
+  setPolicyConfig(true, true);
+
+  EXPECT_TRUE(configuredUseDeltaXds());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_TRUE(state->start_resources_.back().empty());
+
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+
+  setPolicyConfig(false, false);
+
+  EXPECT_FALSE(configuredUseDeltaXds());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  EXPECT_TRUE(subscriptionConnectedForTest());
+  // Once we have an established delta subscription, keep it until transport close even if the
+  // configured desired mode flips back to SotW.
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
+  EXPECT_EQ(state->start_calls_, 2);
+
+  onSubscriptionTransportCloseForTest();
+
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true, false));
+  EXPECT_EQ(state->start_calls_, 3);
+  EXPECT_TRUE(state->start_resources_.back().empty());
+}
+
+TEST_F(CiliumNetworkPolicyTest, FlagFlipWhileDisconnectedRecreatesImmediately) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  ASSERT_FALSE(subscriptionConnectedForTest());
+
+  setPolicyConfig(true, true);
+
+  EXPECT_TRUE(configuredUseDeltaXds());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_TRUE(state->start_resources_.back().empty());
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, FlagFlipFromDisconnectedDeltaToSotwRecreatesImmediately) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  ASSERT_FALSE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+
+  setPolicyConfig(false, false);
+
+  EXPECT_FALSE(configuredUseDeltaXds());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(true, false));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_TRUE(state->start_resources_.back().empty());
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DowngradeFromConnectedDeltaRecreatesDisconnectedRetryToSotw) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+
+  // Agent restart/downgrade drops the established delta transport. While the desired mode is still
+  // delta we recreate immediately and begin retrying delta.
+  onSubscriptionTransportCloseForTest();
+
+  ASSERT_FALSE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+  ASSERT_EQ(state->start_calls_, 2);
+  EXPECT_THAT(created_modes, testing::ElementsAre(true, true));
+  EXPECT_TRUE(state->start_resources_.back().empty());
+
+  // When listener metadata later reveals the downgraded agent no longer supports delta, flip to
+  // SotW immediately rather than letting the disconnected delta retry loop forever.
+  setPolicyConfig(false, false);
+
+  EXPECT_FALSE(configuredUseDeltaXds());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(true, true, false));
+  EXPECT_EQ(state->start_calls_, 3);
+  EXPECT_TRUE(state->start_resources_.back().empty());
+}
+
+TEST_F(CiliumNetworkPolicyTest, TransportCloseWithoutFlagFlipRecreatesInCurrentMode) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  onSubscriptionConnectedForTest();
+
+  onSubscriptionTransportCloseForTest();
+
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, false));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_TRUE(state->start_resources_.back().empty());
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaPoliciesUseDeltaSdsForGenericSecrets) {
+  EXPECT_CALL(secret_manager_, findOrCreateGenericSecretProvider(_, "nonexisting-sds-secret", _, _))
+      .WillOnce(Invoke([](const envoy::config::core::v3::ConfigSource& sds_config_source,
+                          const std::string& config_name,
+                          Server::Configuration::ServerFactoryContext& server_context,
+                          Init::Manager& init_manager) {
+        EXPECT_TRUE(sds_config_source.has_api_config_source());
+        EXPECT_EQ(envoy::config::core::v3::ApiConfigSource::DELTA_GRPC,
+                  sds_config_source.api_config_source().api_type());
+        auto secret_provider = Secret::GenericSecretSdsApi::create(
+            server_context, sds_config_source, config_name, []() {}, false);
+        init_manager.add(*secret_provider->initTarget());
+        return secret_provider;
+      }));
+
+  std::string version;
+  EXPECT_NO_THROW(version = deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-43"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-43" ]
+          http_rules:
+            http_rules:
+            - headers:
+              - name: ':path'
+                exact_match: '/allowed'
+              header_matches:
+              - name: 'bearer-token'
+                value_sds_secret: 'nonexisting-sds-secret'
+                mismatch_action: REPLACE_ON_MISMATCH
+)EOF"));
+  EXPECT_EQ(version, "1");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, SotwDowngrade) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  using ApiType = envoy::config::core::v3::ApiConfigSource::ApiType;
+  auto expect_tls_sds_mode = [this](ApiType api_type) {
+    EXPECT_CALL(secret_manager_, findOrCreateTlsCertificateProvider(_, "secret1", _, _, _))
+        .WillOnce(Invoke([api_type](const envoy::config::core::v3::ConfigSource& sds_config_source,
+                                    const std::string& config_name,
+                                    Server::Configuration::ServerFactoryContext& server_context,
+                                    OptRef<Init::Manager> init_manager, bool /*warm*/) {
+          EXPECT_TRUE(sds_config_source.has_api_config_source());
+          EXPECT_EQ(api_type, sds_config_source.api_config_source().api_type());
+          auto secret_provider = Secret::TlsCertificateSdsApi::create(
+              server_context, sds_config_source, config_name, []() {}, false);
+          if (init_manager.has_value()) {
+            init_manager->add(*secret_provider->initTarget());
+          }
+          return secret_provider;
+        }))
+        .RetiresOnSaturation();
+    EXPECT_CALL(secret_manager_,
+                findOrCreateCertificateValidationContextProvider(_, "cacerts", _, _))
+        .WillOnce(Invoke([api_type](const envoy::config::core::v3::ConfigSource& sds_config_source,
+                                    const std::string& config_name,
+                                    Server::Configuration::ServerFactoryContext& server_context,
+                                    Init::Manager& init_manager) {
+          EXPECT_TRUE(sds_config_source.has_api_config_source());
+          EXPECT_EQ(api_type, sds_config_source.api_config_source().api_type());
+          auto secret_provider = Secret::CertificateValidationContextSdsApi::create(
+              server_context, sds_config_source, config_name, []() {}, false);
+          init_manager.add(*secret_provider->initTarget());
+          return secret_provider;
+        }))
+        .RetiresOnSaturation();
+  };
+
+  startManagedSubscriptionForTest();
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+
+  expect_tls_sds_mode(envoy::config::core::v3::ApiConfigSource::DELTA_GRPC);
+  std::string version;
+  EXPECT_NO_THROW(version = deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      egress_per_port_policies:
+      - port: 80
+        rules:
+        - server_names: [ "example.com" ]
+          downstream_tls_context:
+            tls_sds_secret: "secret1"
+          upstream_tls_context:
+            validation_context_sds_secret: "cacerts"
+)EOF"));
+  EXPECT_EQ(version, "1");
+
+  // Simulate xDS server restart and downgrade to SotW mode
+  onSubscriptionTransportCloseForTest();
+
+  ASSERT_FALSE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+
+  setPolicyConfig(false, false);
+
+  ASSERT_FALSE(subscriptionConnectedForTest());
+  ASSERT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(true, true, false));
+
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+  ASSERT_FALSE(subscriptionUseDeltaXdsForTest());
+
+  // Same NetworkPolicy, but it must be updated for the secret watcher to also use SotW
+  expect_tls_sds_mode(envoy::config::core::v3::ApiConfigSource::GRPC);
+  EXPECT_NO_THROW(version = updateFromYaml(R"EOF(version_info: "1"
+resources:
+- "@type": type.googleapis.com/cilium.NetworkPolicy
+  endpoint_ips:
+  - "10.1.2.3"
+  endpoint_id: 42
+  egress_per_port_policies:
+  - port: 80
+    rules:
+    - server_names: [ "example.com" ]
+      downstream_tls_context:
+        tls_sds_secret: "secret1"
+      upstream_tls_context:
+        validation_context_sds_secret: "cacerts"
+)EOF"));
+  EXPECT_EQ(version, "1");
 }
 
 TEST_F(CiliumNetworkPolicyTest, EmptyPolicyUpdate) {
@@ -261,6 +718,1493 @@ TEST_F(CiliumNetworkPolicyTest, SimplePolicyUpdate) {
 )EOF"));
   EXPECT_EQ(version, "0");
   EXPECT_FALSE(validate("10.1.2.3", "")); // Policy not found
+}
+
+TEST_F(CiliumNetworkPolicyTest, RejectsWhitespaceInSotwWrappedResourceName) {
+  EXPECT_THROW_WITH_MESSAGE(updateFromYaml(R"EOF(version_info: "1"
+resources:
+- "@type": type.googleapis.com/envoy.service.discovery.v3.Resource
+  name: "policy 42"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicy
+    endpoint_ips:
+    - "10.1.2.3"
+    endpoint_id: 42
+)EOF"),
+                            EnvoyException,
+                            "NetworkPolicy resource name 'policy 42' must not contain whitespace");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaIncrementalPolicyUpdate) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 81));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+- name: "policy-42"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 8080
+        rules:
+        - selectors: [ "selector-2" ]
+)EOF"));
+
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 44, 8080));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaSameStreamKeepsUntouchedResources) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+- name: "policy-43"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.2.3.4"
+      endpoint_id: 43
+      ingress_per_port_policies:
+      - port: 81
+        rules:
+        - selectors: [ "selector-2" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_TRUE(ingressAllowed("10.2.3.4", 44, 81));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "selector-3"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 45 ]
+- name: "policy-42"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 8080
+        rules:
+        - selectors: [ "selector-3" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 45, 8080));
+  EXPECT_TRUE(ingressAllowed("10.2.3.4", 44, 81));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRemovesPolicyByResourceName) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      - "f00d::1"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+- name: "policy-43"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.2.3.4"
+      endpoint_id: 43
+      ingress_per_port_policies:
+      - port: 81
+        rules:
+        - selectors: [ "selector-2" ]
+)EOF"));
+
+  EXPECT_TRUE(policy_map_->exists("10.1.2.3"));
+  EXPECT_TRUE(policy_map_->exists("f00d::1"));
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_TRUE(ingressAllowed("f00d::1", 43, 80));
+
+  EXPECT_TRUE(policy_map_->exists("10.2.3.4"));
+  EXPECT_TRUE(ingressAllowed("10.2.3.4", 44, 81));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+removed_resources:
+- "policy-42"
+)EOF"));
+
+  EXPECT_FALSE(policy_map_->exists("10.1.2.3"));
+  EXPECT_FALSE(policy_map_->exists("f00d::1"));
+  EXPECT_FALSE(validate("10.1.2.3", ""));
+  EXPECT_FALSE(validate("f00d::1", ""));
+
+  EXPECT_TRUE(policy_map_->exists("10.2.3.4"));
+  EXPECT_TRUE(ingressAllowed("10.2.3.4", 44, 81));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaSelectorOnlyUpdateTakesEffectImmediately) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44, 45 ]
+)EOF"));
+
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 44, 80));
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 45, 80));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaPolicyUpdateRejectsMissingSelectorResource) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+
+  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "policy-42"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-2" ]
+)EOF"),
+                            EnvoyException,
+                            "NetworkPolicyResource rule references missing selector resource "
+                            "'selector-2'");
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRemovedAndReaddedSelectorNameDoesNotRebindOldPolicy) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  const auto old_policy = policyInstanceShared("10.1.2.3");
+  ASSERT_NE(nullptr, old_policy);
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+removed_resources:
+- "selector-1"
+)EOF"));
+
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "3"
+resources:
+- name: "selector-1"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+)EOF"));
+
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+  EXPECT_EQ(old_policy.get(), policyInstanceShared("10.1.2.3").get());
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "4"
+resources:
+- name: "policy-42"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+  EXPECT_EQ(old_policy.get(), policyInstanceShared("10.1.2.3").get());
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRemovedAndReaddedSelectorNameInSameUpdateActsAsUpdate) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+removed_resources:
+- "selector-1"
+resources:
+- name: "selector-1"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+)EOF"));
+
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 44, 80));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectedSelectorUpdateKeepsPublishedBehavior) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "10.1.2.3"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource .*update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming selector resource '10\.1\.2\.3'.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-42'.*endpoint_id 42.*10\.1\.2\.3)");
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaPassUsesCurrentSelectorMembership) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43, 44 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - precedence: 1000
+          pass_precedence: 501
+          selectors: [ "selector-1" ]
+        - precedence: 900
+          deny: true
+        - precedence: 500
+          selectors: [ "selector-2" ]
+          http_rules:
+            http_rules:
+            - headers:
+              - name: ':path'
+                exact_match: '/allowed'
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80, {{":path", "/allowed"}}));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80, {{":path", "/allowed"}}));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaWildcardPortPassIsMergedToExactPortRules) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43, 44 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 0
+        rules:
+        - precedence: 1000
+          pass_precedence: 501
+          selectors: [ "selector-1" ]
+      - port: 80
+        rules:
+        - precedence: 900
+          deny: true
+        - precedence: 500
+          selectors: [ "selector-2" ]
+          http_rules:
+            http_rules:
+            - headers:
+              - name: ':path'
+                exact_match: '/allowed'
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80, {{":path", "/allowed"}}));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80, {{":path", "/allowed"}}));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaSamePrecedenceDenyWinsOverPass) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - precedence: 1000
+          pass_precedence: 501
+          selectors: [ "selector-1" ]
+        - precedence: 1000
+          deny: true
+          selectors: [ "selector-1" ]
+        - precedence: 500
+          selectors: [ "selector-1" ]
+          http_rules:
+            http_rules:
+            - headers:
+              - name: ':path'
+                exact_match: '/allowed'
+)EOF"));
+
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80, {{":path", "/allowed"}}));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaSelectorOnlyUpdateChangesPassBehaviorImmediately) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43, 44 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - precedence: 1000
+          pass_precedence: 501
+          selectors: [ "selector-1" ]
+        - precedence: 900
+          deny: true
+        - precedence: 500
+          selectors: [ "selector-2" ]
+          http_rules:
+            http_rules:
+            - headers:
+              - name: ':path'
+                exact_match: '/allowed'
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80, {{":path", "/allowed"}}));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80, {{":path", "/allowed"}}));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "selector-1"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+)EOF"));
+
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80, {{":path", "/allowed"}}));
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 44, 80, {{":path", "/allowed"}}));
+}
+
+TEST_F(CiliumNetworkPolicyTest, SotwRejectsSelectorsInRules) {
+  EXPECT_THROW(updateFromYaml(R"EOF(version_info: "1"
+resources:
+- "@type": type.googleapis.com/cilium.NetworkPolicy
+  endpoint_ips:
+  - "10.1.2.3"
+  endpoint_id: 42
+  ingress_per_port_policies:
+  - port: 80
+    rules:
+    - selectors: [ "selector-1" ]
+)EOF"),
+               EnvoyException);
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAcceptsArbitrarySelectorResourceName) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "7"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44, 45 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "7" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 44, 80));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsEmbeddedRemotePoliciesInRules) {
+  EXPECT_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - remote_policies: [ 43 ]
+)EOF"),
+               EnvoyException);
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAcceptsArbitraryPolicyResourceName) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+)EOF"));
+
+  EXPECT_TRUE(policy_map_->exists("10.1.2.3"));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsAddedResourceNamesWithWhitespace) {
+  EXPECT_THROW_WITH_MESSAGE(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector 1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+)EOF"),
+      EnvoyException,
+      "NetworkPolicyResource added resource name 'selector 1' must not contain whitespace");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsRemovedResourceNamesWithWhitespace) {
+  EXPECT_THROW_WITH_MESSAGE(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+removed_resources:
+- "selector 1"
+)EOF"),
+      EnvoyException,
+      "NetworkPolicyResource removed resource name 'selector 1' must not contain whitespace");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsDuplicatePolicyResourceNamesInSameUpdate) {
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "shared-name"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+- name: "shared-name"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.4"
+      endpoint_id: 43
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key 'shared-name'.*incoming policy resource 'shared-name'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource 'shared-name'.*endpoint_id 42.*10\.1\.2\.3)");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAcceptsPolicyResourceNamesThatDoNotMatchEndpointId) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "policy-43"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+)EOF"));
+
+  EXPECT_TRUE(policy_map_->exists("10.1.2.3"));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsEndpointIpCollisionsInSameUpdate) {
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "policy-a"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+- name: "policy-b"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 43
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.3.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsResourceNameEndpointIpCollisionsInSameUpdate) {
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "10.1.2.4"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+- name: "policy-b"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.4"
+      endpoint_id: 43
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.4'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource '10\.1\.2\.4'.*endpoint_id 42.*10\.1\.2\.3)");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsDuplicateSelectorResourceNamesInSameUpdate) {
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "shared-selector"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44, 45 ]
+- name: "shared-selector"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 46, 47 ]
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource .*update for version [0-9]+ has duplicate resource key 'shared-selector'.*incoming selector resource 'shared-selector'.*existing selector resource 'shared-selector')");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAcceptsArbitraryPolicyResourceNamesWithHyphens) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-qualified-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRemovesPoliciesByArbitraryResourceName) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+- name: "policy-qualified-43"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.4"
+      endpoint_id: 43
+)EOF"));
+
+  EXPECT_TRUE(policy_map_->exists("10.1.2.3"));
+  EXPECT_TRUE(policy_map_->exists("10.1.2.4"));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+removed_resources:
+- "42"
+)EOF"));
+
+  EXPECT_FALSE(policy_map_->exists("10.1.2.3"));
+  EXPECT_TRUE(policy_map_->exists("10.1.2.4"));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsEndpointIpCollisionsWithExistingPolicies) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "policy-a"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+)EOF"));
+
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "policy-b"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 43
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.3.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest,
+       DeltaRejectsPolicyResourceNameCollidingWithExistingEndpointIp) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "policy-a"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+)EOF"));
+
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "10.1.2.3"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.4"
+      endpoint_id: 43
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource '10\.1\.2\.3'.*endpoint_id 43.*10\.1\.2\.4.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest,
+       DeltaRejectsEndpointIpCollidingWithExistingPolicyResourceName) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "10.1.2.4"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+)EOF"));
+
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "policy-b"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.4"
+      endpoint_id: 43
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.4'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource '10\.1\.2\.4'.*endpoint_id 42.*10\.1\.2\.3)");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest,
+       DeltaRejectsSelectorResourceNameCollidingWithExistingPolicyResourceName) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "shared-name"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+)EOF"));
+
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "shared-name"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource .*update for version [0-9]+ has duplicate resource key 'shared-name'.*incoming selector resource 'shared-name'.*existing policy resource 'shared-name'.*endpoint_id 42.*10\.1\.2\.3)");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest,
+       DeltaRejectsSelectorResourceNameCollidingWithExistingEndpointIp) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "policy-a"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+)EOF"));
+
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "10.1.2.3"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+)EOF"),
+      EnvoyException,
+      R"(NetworkPolicyResource .*update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming selector resource '10\.1\.2\.3'.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsRemovingPolicyEndpointIpAlias) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "policy-a"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+)EOF"));
+
+  EXPECT_THROW_WITH_MESSAGE(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+removed_resources:
+- "10.1.2.3"
+)EOF"),
+      EnvoyException,
+      "NetworkPolicyResource removed resource '10.1.2.3' is a policy endpoint IP alias, not a "
+      "resource name");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAllowsEndpointIpReusingRemovedPolicyResourceName) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "10.1.2.4"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+)EOF"));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+removed_resources:
+- "10.1.2.4"
+resources:
+- name: "policy-b"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.4"
+      endpoint_id: 43
+)EOF"));
+
+  EXPECT_FALSE(policy_map_->exists("10.1.2.3"));
+  EXPECT_TRUE(policy_map_->exists("10.1.2.4"));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAcceptsPolicyResourceNamesWithNumericSuffixes) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "policy-042"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+- name: "policy-0"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.4"
+      endpoint_id: 43
+)EOF"));
+
+  EXPECT_TRUE(policy_map_->exists("10.1.2.3"));
+  EXPECT_TRUE(policy_map_->exists("10.1.2.4"));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsZeroEndpointIdRegardlessOfResourceName) {
+  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "policy-0"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 0
+)EOF"),
+                            EnvoyException, "NetworkPolicyResource endpoint_id must be non-zero");
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsInconsistentPassPrecedence) {
+  EXPECT_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - precedence: 1000
+          pass_precedence: 100
+          selectors: [ "selector-1" ]
+        - precedence: 900
+          pass_precedence: 200
+          selectors: [ "selector-2" ]
+)EOF"),
+               EnvoyException);
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaNewStreamReplacesStateWithFullSnapshot) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+- name: "policy-43"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.2.3.4"
+      endpoint_id: 43
+      ingress_per_port_policies:
+      - port: 81
+        rules:
+        - selectors: [ "selector-2" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
+  EXPECT_TRUE(ingressAllowed("10.2.3.4", 44, 81));
+
+  resetStreamForTest();
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "selector-3"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 45 ]
+- name: "policy-42"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 8080
+        rules:
+        - selectors: [ "selector-3" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 45, 8080));
+  EXPECT_FALSE(policy_map_->exists("10.2.3.4"));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DeltaNewStreamClearsStaleResourceNamesFromResourceMap) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+- name: "policy-43"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.2.3.4"
+      endpoint_id: 43
+      ingress_per_port_policies:
+      - port: 81
+        rules:
+        - selectors: [ "selector-2" ]
+)EOF"));
+
+  resetStreamForTest();
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "selector-3"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 45 ]
+- name: "policy-42"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 8080
+        rules:
+        - selectors: [ "selector-3" ]
+)EOF"));
+
+  EXPECT_FALSE(policy_map_->exists("10.2.3.4"));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "3"
+resources:
+- name: "policy-43"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 46 ]
+)EOF"));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "4"
+resources:
+- name: "policy-42"
+  version: "3"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 9090
+        rules:
+        - selectors: [ "policy-43" ]
+)EOF"));
+
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 46, 9090));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, SameStreamSelectorOnlyUpdateUsesLatestSelectorSnapshot) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  const auto old_policy = policyInstanceShared("10.1.2.3");
+  ASSERT_NE(nullptr, old_policy);
+  const auto initial_stream_generation = selectorStreamGenerationForTest(*old_policy);
+
+  EXPECT_GT(initial_stream_generation, 0);
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_EQ(1, selectorVersionForTest(*old_policy));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "selector-1"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+)EOF"));
+
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_EQ(2, selectorVersionForTest(*old_policy));
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 44, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, NewStreamKeepsOldPolicyPinnedToOldSelectorSnapshot) {
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "selector-2"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+- name: "policy-42"
+  version: "1"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  const auto old_policy = policyInstanceShared("10.1.2.3");
+  ASSERT_NE(nullptr, old_policy);
+  const auto initial_stream_generation = selectorStreamGenerationForTest(*old_policy);
+
+  EXPECT_GT(initial_stream_generation, 0);
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_EQ(1, selectorVersionForTest(*old_policy));
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+resources:
+- name: "selector-1"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 45 ]
+)EOF"));
+
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_EQ(2, selectorVersionForTest(*old_policy));
+
+  resetStreamForTest();
+
+  EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+resources:
+- name: "selector-1"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 44 ]
+- name: "selector-2"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    selector:
+      remote_identities: [ 43 ]
+- name: "policy-42"
+  version: "2"
+  resource:
+    "@type": type.googleapis.com/cilium.NetworkPolicyResource
+    policy:
+      endpoint_ips:
+      - "10.1.2.3"
+      endpoint_id: 42
+      ingress_per_port_policies:
+      - port: 80
+        rules:
+        - selectors: [ "selector-1" ]
+)EOF"));
+
+  const auto new_policy = policyInstanceShared("10.1.2.3");
+  ASSERT_NE(nullptr, new_policy);
+  EXPECT_NE(old_policy.get(), new_policy.get());
+
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_EQ(2, selectorVersionForTest(*old_policy));
+  EXPECT_EQ(initial_stream_generation + 1, selectorStreamGenerationForTest(*new_policy));
+  EXPECT_EQ(3, selectorVersionForTest(*new_policy));
+  EXPECT_TRUE(ingressAllowed("10.1.2.3", 44, 80));
+  EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));
 }
 
 TEST_F(CiliumNetworkPolicyTest, OverlappingPortRange) {

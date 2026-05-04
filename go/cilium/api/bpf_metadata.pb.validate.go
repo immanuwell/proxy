@@ -204,6 +204,8 @@ func (m *BpfMetadata) validate(all bool) error {
 		}
 	}
 
+	// no validation rules for PolicyType
+
 	if m.OriginalSourceSoLingerTime != nil {
 		// no validation rules for OriginalSourceSoLingerTime
 	}

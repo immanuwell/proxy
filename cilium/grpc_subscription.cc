@@ -87,6 +87,7 @@ TypeUrlToServiceMap* buildTypeUrlToServiceMap() {
   // https://www.mail-archive.com/protobuf@googlegroups.com/msg04540.html.
   for (absl::string_view name : {
            "cilium.NetworkPolicyDiscoveryService",
+           "cilium.NetworkPolicyResourceDiscoveryService",
            "cilium.NetworkPolicyHostsDiscoveryService",
        }) {
     const auto* service_desc =

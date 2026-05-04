@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 
+#include "envoy/common/exception.h"
 #include "envoy/common/pure.h"
 #include "envoy/common/regex.h"
 #include "envoy/config/core/v3/base.pb.h"
@@ -41,6 +42,7 @@ namespace Cilium {
 
 class PortNetworkPolicyRules;
 class PolicySnapshot;
+using SelectorVersion = uint64_t;
 
 // PortPolicy holds a reference to a set of rules in a policy map that apply to the given port.
 // Methods then iterate through the set to determine if policy allows or denies. This is needed to
@@ -51,7 +53,7 @@ protected:
   friend class PortNetworkPolicy;
   friend class DenyAllPolicyInstanceImpl;
   friend class AllowAllEgressPolicyInstanceImpl;
-  PortPolicy(const PolicySnapshot& map, uint16_t port);
+  PortPolicy(const PolicySnapshot& map, uint16_t port, SelectorVersion selector_version);
 
 public:
   // If hasHttpRules() returns false, then HTTP policy enforcement can be skipped,
@@ -97,6 +99,7 @@ private:
   //   rules.
   const PortNetworkPolicyRules* port_rules_;
   const bool has_http_rules_;
+  const SelectorVersion selector_version_;
 };
 
 class IpAddressPair {
@@ -168,6 +171,35 @@ private:
   ProtobufMessage::ValidationVisitor& validation_visitor_;
 };
 
+// cilium::NetworkPolicyResource does not carry a resource name, but relies on the
+// DeltaDiscoveryRespons Resource wrapper to have the name. Hence can not use
+// Envoy::Config::OpaqueResourceDecoderImpl<cilium::NetworkPolicyResource>
+class NetworkPolicyResourceDecoder : public Envoy::Config::OpaqueResourceDecoder {
+public:
+  NetworkPolicyResourceDecoder()
+      : validation_visitor_(ProtobufMessage::getNullValidationVisitor()) {}
+
+  // Config::OpaqueResourceDecoder
+  ProtobufTypes::MessagePtr decodeResource(const Protobuf::Any& resource) override {
+    auto typed_message = std::make_unique<cilium::NetworkPolicyResource>();
+    // If the Any is a synthetic empty message (e.g. because the resource field
+    // was not set in Resource, this might be empty, so we shouldn't decode.
+    if (!resource.type_url().empty()) {
+      MessageUtil::anyConvertAndValidate<cilium::NetworkPolicyResource>(resource, *typed_message,
+                                                                        validation_visitor_);
+    }
+    return typed_message;
+  }
+
+  std::string resourceName(const Protobuf::Message&) override {
+    throw EnvoyException(
+        "NetworkPolicyResource does not carry a name and must be wrapped in Resource");
+  }
+
+private:
+  ProtobufMessage::ValidationVisitor& validation_visitor_;
+};
+
 /**
  * All Cilium L7 filter stats. @see stats_macros.h
  */
@@ -194,16 +226,15 @@ class NetworkPolicyMapImpl;
 
 class NetworkPolicyMap : public Singleton::Instance, public Logger::Loggable<Logger::Id::config> {
 public:
-  NetworkPolicyMap(Server::Configuration::FactoryContext& context,
+  NetworkPolicyMap(Server::Configuration::FactoryContext& context, bool use_nprds,
                    const envoy::config::core::v3::ConfigSource& config_source,
                    bool subscribe = false);
 
   ~NetworkPolicyMap() override;
 
   bool exists(const std::string& endpoint_policy_name) const;
-  bool useDeltaXds() const;
 
-  void setConfigSource(const envoy::config::core::v3::ConfigSource& config_source);
+  void setConfig(bool use_nprds, const envoy::config::core::v3::ConfigSource& config_source);
 
   const PolicyInstance& getPolicyInstance(const std::string& endpoint_policy_name,
                                           bool allow_egress) const;
@@ -221,11 +252,14 @@ protected:
   void resetStreamForTest();
   PolicyInstanceConstSharedPtr
   getPolicyInstanceSharedForTest(const std::string& endpoint_policy_name) const;
+  uint64_t policySelectorStreamGenerationForTest(const PolicyInstance& policy) const;
+  SelectorVersion policySelectorVersionForTest(const PolicyInstance& policy) const;
   void startSubscriptionForTest(std::unique_ptr<Envoy::Config::Subscription>&& subscription);
   void startManagedSubscriptionForTest();
   void setSubscriptionFactoryForTest(SubscriptionFactoryForTest factory);
   void onSubscriptionConnectedForTest();
   void onSubscriptionTransportCloseForTest();
+  bool desiredUseDeltaXdsForTest() const;
   bool subscriptionUseDeltaXdsForTest() const;
   bool subscriptionConnectedForTest() const;
   Envoy::Config::SubscriptionCallbacks& subscriptionCallbacksForTest() const;

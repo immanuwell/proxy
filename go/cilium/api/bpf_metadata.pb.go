@@ -24,6 +24,53 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Policy type to use
+type BpfMetadata_PolicyType int32
+
+const (
+	BpfMetadata_NPDS  BpfMetadata_PolicyType = 0 // Legacy NPDS (default)
+	BpfMetadata_NPRDS BpfMetadata_PolicyType = 1 // New NetworkPolicyResource (NPRDS)
+)
+
+// Enum value maps for BpfMetadata_PolicyType.
+var (
+	BpfMetadata_PolicyType_name = map[int32]string{
+		0: "NPDS",
+		1: "NPRDS",
+	}
+	BpfMetadata_PolicyType_value = map[string]int32{
+		"NPDS":  0,
+		"NPRDS": 1,
+	}
+)
+
+func (x BpfMetadata_PolicyType) Enum() *BpfMetadata_PolicyType {
+	p := new(BpfMetadata_PolicyType)
+	*p = x
+	return p
+}
+
+func (x BpfMetadata_PolicyType) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (BpfMetadata_PolicyType) Descriptor() protoreflect.EnumDescriptor {
+	return file_cilium_api_bpf_metadata_proto_enumTypes[0].Descriptor()
+}
+
+func (BpfMetadata_PolicyType) Type() protoreflect.EnumType {
+	return &file_cilium_api_bpf_metadata_proto_enumTypes[0]
+}
+
+func (x BpfMetadata_PolicyType) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use BpfMetadata_PolicyType.Descriptor instead.
+func (BpfMetadata_PolicyType) EnumDescriptor() ([]byte, []int) {
+	return file_cilium_api_bpf_metadata_proto_rawDescGZIP(), []int{0, 0}
+}
+
 type BpfMetadata struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// File system root for bpf. Bpf will not be used if left empty.
@@ -89,7 +136,8 @@ type BpfMetadata struct {
 	CacheGcInterval *durationpb.Duration `protobuf:"bytes,15,opt,name=cache_gc_interval,json=cacheGcInterval,proto3" json:"cache_gc_interval,omitempty"`
 	// Configuration for the source of Cilium xDS updates.
 	// Used for all cilium-specific xDS protocol, e.g., NPHDS, NPDS, and Secrets (SDS) therein.
-	CiliumConfigSource *v3.ConfigSource `protobuf:"bytes,16,opt,name=cilium_config_source,json=ciliumConfigSource,proto3" json:"cilium_config_source,omitempty"`
+	CiliumConfigSource *v3.ConfigSource       `protobuf:"bytes,16,opt,name=cilium_config_source,json=ciliumConfigSource,proto3" json:"cilium_config_source,omitempty"`
+	PolicyType         BpfMetadata_PolicyType `protobuf:"varint,17,opt,name=policy_type,json=policyType,proto3,enum=cilium.BpfMetadata_PolicyType" json:"policy_type,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -236,11 +284,18 @@ func (x *BpfMetadata) GetCiliumConfigSource() *v3.ConfigSource {
 	return nil
 }
 
+func (x *BpfMetadata) GetPolicyType() BpfMetadata_PolicyType {
+	if x != nil {
+		return x.PolicyType
+	}
+	return BpfMetadata_NPDS
+}
+
 var File_cilium_api_bpf_metadata_proto protoreflect.FileDescriptor
 
 const file_cilium_api_bpf_metadata_proto_rawDesc = "" +
 	"\n" +
-	"\x1dcilium/api/bpf_metadata.proto\x12\x06cilium\x1a(envoy/config/core/v3/config_source.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x17validate/validate.proto\"\xea\x06\n" +
+	"\x1dcilium/api/bpf_metadata.proto\x12\x06cilium\x1a(envoy/config/core/v3/config_source.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x17validate/validate.proto\"\xce\a\n" +
 	"\vBpfMetadata\x12\x19\n" +
 	"\bbpf_root\x18\x01 \x01(\tR\abpfRoot\x12\x1d\n" +
 	"\n" +
@@ -259,7 +314,13 @@ const file_cilium_api_bpf_metadata_proto_rawDesc = "" +
 	"\tuse_nphds\x18\r \x01(\bR\buseNphds\x12A\n" +
 	"\x0fcache_entry_ttl\x18\x0e \x01(\v2\x19.google.protobuf.DurationR\rcacheEntryTtl\x12E\n" +
 	"\x11cache_gc_interval\x18\x0f \x01(\v2\x19.google.protobuf.DurationR\x0fcacheGcInterval\x12T\n" +
-	"\x14cilium_config_source\x18\x10 \x01(\v2\".envoy.config.core.v3.ConfigSourceR\x12ciliumConfigSourceB!\n" +
+	"\x14cilium_config_source\x18\x10 \x01(\v2\".envoy.config.core.v3.ConfigSourceR\x12ciliumConfigSource\x12?\n" +
+	"\vpolicy_type\x18\x11 \x01(\x0e2\x1e.cilium.BpfMetadata.PolicyTypeR\n" +
+	"policyType\"!\n" +
+	"\n" +
+	"PolicyType\x12\b\n" +
+	"\x04NPDS\x10\x00\x12\t\n" +
+	"\x05NPRDS\x10\x01B!\n" +
 	"\x1f_original_source_so_linger_timeB.Z,github.com/cilium/proxy/go/cilium/api;ciliumb\x06proto3"
 
 var (
@@ -274,22 +335,25 @@ func file_cilium_api_bpf_metadata_proto_rawDescGZIP() []byte {
 	return file_cilium_api_bpf_metadata_proto_rawDescData
 }
 
+var file_cilium_api_bpf_metadata_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_cilium_api_bpf_metadata_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_cilium_api_bpf_metadata_proto_goTypes = []any{
-	(*BpfMetadata)(nil),         // 0: cilium.BpfMetadata
-	(*durationpb.Duration)(nil), // 1: google.protobuf.Duration
-	(*v3.ConfigSource)(nil),     // 2: envoy.config.core.v3.ConfigSource
+	(BpfMetadata_PolicyType)(0), // 0: cilium.BpfMetadata.PolicyType
+	(*BpfMetadata)(nil),         // 1: cilium.BpfMetadata
+	(*durationpb.Duration)(nil), // 2: google.protobuf.Duration
+	(*v3.ConfigSource)(nil),     // 3: envoy.config.core.v3.ConfigSource
 }
 var file_cilium_api_bpf_metadata_proto_depIdxs = []int32{
-	1, // 0: cilium.BpfMetadata.policy_update_warning_limit:type_name -> google.protobuf.Duration
-	1, // 1: cilium.BpfMetadata.cache_entry_ttl:type_name -> google.protobuf.Duration
-	1, // 2: cilium.BpfMetadata.cache_gc_interval:type_name -> google.protobuf.Duration
-	2, // 3: cilium.BpfMetadata.cilium_config_source:type_name -> envoy.config.core.v3.ConfigSource
-	4, // [4:4] is the sub-list for method output_type
-	4, // [4:4] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	2, // 0: cilium.BpfMetadata.policy_update_warning_limit:type_name -> google.protobuf.Duration
+	2, // 1: cilium.BpfMetadata.cache_entry_ttl:type_name -> google.protobuf.Duration
+	2, // 2: cilium.BpfMetadata.cache_gc_interval:type_name -> google.protobuf.Duration
+	3, // 3: cilium.BpfMetadata.cilium_config_source:type_name -> envoy.config.core.v3.ConfigSource
+	0, // 4: cilium.BpfMetadata.policy_type:type_name -> cilium.BpfMetadata.PolicyType
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_cilium_api_bpf_metadata_proto_init() }
@@ -303,13 +367,14 @@ func file_cilium_api_bpf_metadata_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cilium_api_bpf_metadata_proto_rawDesc), len(file_cilium_api_bpf_metadata_proto_rawDesc)),
-			NumEnums:      0,
+			NumEnums:      1,
 			NumMessages:   1,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_cilium_api_bpf_metadata_proto_goTypes,
 		DependencyIndexes: file_cilium_api_bpf_metadata_proto_depIdxs,
+		EnumInfos:         file_cilium_api_bpf_metadata_proto_enumTypes,
 		MessageInfos:      file_cilium_api_bpf_metadata_proto_msgTypes,
 	}.Build()
 	File_cilium_api_bpf_metadata_proto = out.File

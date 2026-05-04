@@ -280,13 +280,15 @@ Config::Config(const ::cilium::BpfMetadata& config,
   // instances!
   // Only created if either ipcache_ or hosts_ map exists
   if (ipcache_ || hosts_) {
+    bool use_nprds = config.policy_type() == cilium::BpfMetadata::NPRDS;
     npmap_ = context.serverFactoryContext().singletonManager().getTyped<Cilium::NetworkPolicyMap>(
         SINGLETON_MANAGER_REGISTERED_NAME(cilium_network_policy),
-        [&context, config_source = config_source_] {
-          return std::make_shared<Cilium::NetworkPolicyMap>(context, config_source, true);
+        [&context, use_nprds, config_source = config_source_] {
+          return std::make_shared<Cilium::NetworkPolicyMap>(context, use_nprds, config_source,
+                                                            true);
         });
-    // update desired config source on the map
-    npmap_->setConfigSource(config_source_);
+    // update desired config on the map
+    npmap_->setConfig(use_nprds, config_source_);
   }
 }
 

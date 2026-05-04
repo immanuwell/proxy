@@ -87,4 +87,11 @@ message BpfMetadata {
   // Configuration for the source of Cilium xDS updates.
   // Used for all cilium-specific xDS protocol, e.g., NPHDS, NPDS, and Secrets (SDS) therein.
   envoy.config.core.v3.ConfigSource cilium_config_source = 16;
+
+  // Policy type to use
+  enum PolicyType {
+    NPDS = 0;  // Legacy NPDS (default)
+    NPRDS = 1; // New NetworkPolicyResource (NPRDS)
+  }
+  PolicyType policy_type = 17;
 }

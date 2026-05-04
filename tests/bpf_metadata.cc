@@ -112,8 +112,8 @@ TestHelper::createPolicyMap(const std::string& config,
             policy_path, context.serverFactoryContext().api()));
         Envoy::Config::SubscriptionStats stats =
             Envoy::Config::Utility::generateStats(context.scope());
-        auto map =
-            std::make_shared<Cilium::NetworkPolicyMap>(context, Cilium::CILIUM_XDS_API_CONFIG);
+        auto map = std::make_shared<Cilium::NetworkPolicyMap>(context, false,
+                                                              Cilium::CILIUM_XDS_API_CONFIG);
         auto subscription = std::make_unique<Envoy::Config::FilesystemSubscriptionImpl>(
             context.serverFactoryContext().mainThreadDispatcher(),
             Envoy::Config::makePathConfigSource(policy_path), map->subscriptionCallbacksForTest(),
