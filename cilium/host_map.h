@@ -15,6 +15,7 @@
 
 #include "envoy/common/exception.h"
 #include "envoy/config/core/v3/config_source.pb.h"
+#include "envoy/config/grpc_mux.h"
 #include "envoy/config/subscription.h"
 #include "envoy/network/address.h"
 #include "envoy/protobuf/message_validator.h"
@@ -26,7 +27,6 @@
 #include "envoy/thread_local/thread_local_object.h"
 
 #include "source/common/common/logger.h"
-#include "source/common/common/macros.h"
 #include "source/common/network/utility.h"
 #include "source/common/protobuf/message_validator_impl.h"
 #include "source/common/protobuf/protobuf.h"
@@ -117,6 +117,8 @@ public:
 
   void startSubscription(Server::Configuration::CommonFactoryContext& context,
                          const envoy::config::core::v3::ConfigSource& config_source);
+
+  void setConfigSource(const envoy::config::core::v3::ConfigSource& config_source);
 
   // This is used for testing with a file-based subscription
   void startSubscription(std::unique_ptr<Envoy::Config::Subscription>&& subscription) {
@@ -229,22 +231,30 @@ public:
                               const std::string& version_info) override;
   absl::Status onConfigUpdate(const std::vector<Envoy::Config::DecodedResourceRef>& added_resources,
                               const Protobuf::RepeatedPtrField<std::string>& removed_resources,
-                              const std::string& system_version_info) override {
-    // NOT IMPLEMENTED YET.
-    UNREFERENCED_PARAMETER(added_resources);
-    UNREFERENCED_PARAMETER(removed_resources);
-    UNREFERENCED_PARAMETER(system_version_info);
-    return absl::OkStatus();
-  }
+                              const std::string& system_version_info) override;
   void onConfigUpdateFailed(Envoy::Config::ConfigUpdateFailureReason,
                             const EnvoyException* e) override;
 
 private:
+  bool subscriptionUseDeltaXds() const;
+  void subscribe();
+  void onSubscriptionStreamEvent(uint64_t subscription_id, Config::GrpcMuxStreamEvent event);
+  void maybeRecreateSubscriptionInDesiredMode(bool transport_closed);
+
   ThreadLocal::SlotPtr tls_;
   std::string name_;
   Stats::ScopeSharedPtr scope_;
   Stats::ScopeSharedPtr stats_scope_;
   std::unique_ptr<Envoy::Config::Subscription> subscription_;
+  Server::Configuration::CommonFactoryContext* context_{nullptr};
+  // We need a separate desired_config_source_ as it may be set to a pessimistic value via explicit
+  // BpfMetadata config in CiliumEnvoyConfig CRD, and we should not change to a "worse" (e.g., SotW)
+  // ConfigSource if "better" (e.g., Delta) is already up-and-running (in config_source_).
+  envoy::config::core::v3::ConfigSource desired_config_source_;
+  envoy::config::core::v3::ConfigSource config_source_;
+  uint64_t subscription_id_{0};
+  uint64_t accepted_subscription_id_{0};
+  bool subscription_connected_{false};
   static uint64_t instance_id_;
   PolicyHostsStats stats_;
 };

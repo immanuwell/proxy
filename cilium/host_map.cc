@@ -4,15 +4,18 @@
 #include <fmt/format.h>
 #include <sys/socket.h>
 
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include "envoy/common/exception.h"
 #include "envoy/config/core/v3/config_source.pb.h"
+#include "envoy/config/grpc_mux.h"
 #include "envoy/config/subscription.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/server/factory_context.h"
@@ -21,9 +24,11 @@
 #include "envoy/thread_local/thread_local.h"
 #include "envoy/thread_local/thread_local_object.h"
 
+#include "source/common/common/assert.h"
 #include "source/common/common/logger.h"
 #include "source/common/common/macros.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/numeric/int128.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
@@ -58,9 +63,18 @@ unsigned int checkPrefix(T addr, bool have_prefix, unsigned int plen, absl::stri
 } // namespace
 
 struct ThreadLocalHostMapInitializer : public PolicyHostMap::ThreadLocalHostMap {
-protected:
+public:
   friend class PolicyHostMap; // PolicyHostMap can insert();
 
+  ThreadLocalHostMapInitializer() = default;
+
+  explicit ThreadLocalHostMapInitializer(const PolicyHostMap::ThreadLocalHostMap* host_map) {
+    if (host_map != nullptr) {
+      static_cast<PolicyHostMap::ThreadLocalHostMap&>(*this) = *host_map;
+    }
+  }
+
+protected:
   // find the map of the given prefix length, insert in the decreasing order if
   // it does not exist
   template <typename M>
@@ -159,6 +173,29 @@ protected:
           fmt::format("NetworkPolicyHosts: Invalid host entry \'{}\' for policy {}", host, policy));
     }
   }
+
+  template <typename MapVec>
+  void prunePolicyMapVec(MapVec& maps, const absl::flat_hash_set<uint64_t>& nids) {
+    for (auto vec_it = maps.begin(); vec_it != maps.end();) {
+      auto& map = vec_it->second;
+      for (auto map_it = map.begin(); map_it != map.end();) {
+        auto it = map_it++;
+        if (nids.contains(it->second)) {
+          map.erase(it);
+        }
+      }
+      if (map.empty()) {
+        vec_it = maps.erase(vec_it);
+      } else {
+        ++vec_it;
+      }
+    }
+  }
+
+  void remove(const absl::flat_hash_set<uint64_t>& removed_nids) {
+    prunePolicyMapVec(ipv4_to_policy_, removed_nids);
+    prunePolicyMapVec(ipv6_to_policy_, removed_nids);
+  }
 };
 
 uint64_t PolicyHostMap::instance_id_ = 0;
@@ -196,20 +233,153 @@ PolicyHostMap::PolicyHostMap(Server::Configuration::CommonFactoryContext& contex
 }
 
 void PolicyHostMap::startSubscription(Server::Configuration::CommonFactoryContext& context,
-                                      const envoy::config::core::v3::ConfigSource& config_source) {
-  if (config_source.config_source_specifier_case() == envoy::config::core::v3::ConfigSource::kAds) {
-    auto ads_mux = context.xdsManager().adsMux();
-    subscription_ = THROW_OR_RETURN_VALUE(
-        context.clusterManager().subscriptionFactory().subscriptionOverAdsGrpcMux(
-            ads_mux, config_source, NetworkPolicyHostsTypeUrl, *scope_, *this,
-            std::make_shared<Cilium::PolicyHostDecoder>(), {}),
-        Config::SubscriptionPtr);
-  } else {
-    subscription_ = subscribe(NetworkPolicyHostsTypeUrl, config_source, context, *scope_, *this,
-                              std::make_shared<Cilium::PolicyHostDecoder>());
+                                      const envoy::config::core::v3::ConfigSource& npds_config) {
+  context_ = &context;
+  desired_config_source_ = npds_config;
+  subscribe();
+}
+
+void PolicyHostMap::setConfigSource(const envoy::config::core::v3::ConfigSource& config_source) {
+  desired_config_source_ = config_source;
+  if (context_ != nullptr) {
+    maybeRecreateSubscriptionInDesiredMode(/*transport_closed=*/false);
+  }
+}
+
+bool PolicyHostMap::subscriptionUseDeltaXds() const {
+  if (!config_source_.has_api_config_source()) {
+    return false;
+  }
+  const auto& api_type = config_source_.api_config_source().api_type();
+  return api_type == envoy::config::core::v3::ApiConfigSource::DELTA_GRPC ||
+         api_type == envoy::config::core::v3::ApiConfigSource::AGGREGATED_DELTA_GRPC;
+}
+
+void PolicyHostMap::subscribe() {
+  ASSERT(context_ != nullptr);
+  subscription_connected_ = false;
+  config_source_ = desired_config_source_;
+  ++subscription_id_;
+
+  auto on_stream_event = [weak_this = weak_from_this(),
+                          id = subscription_id_](Config::GrpcMuxStreamEvent event) {
+    if (auto shared_this = weak_this.lock()) {
+      shared_this->onSubscriptionStreamEvent(id, event);
+    }
+  };
+
+  subscription_ =
+      Cilium::subscribe(NetworkPolicyHostsTypeUrl, config_source_, *context_, *scope_, *this,
+                        std::make_shared<Cilium::PolicyHostDecoder>(), std::move(on_stream_event));
+  subscription_->start({});
+}
+
+void PolicyHostMap::onSubscriptionStreamEvent(uint64_t subscription_id,
+                                              Config::GrpcMuxStreamEvent event) {
+  if (subscription_id != subscription_id_) {
+    return;
   }
 
-  subscription_->start({});
+  switch (event) {
+  case Config::GrpcMuxStreamEvent::Established:
+    subscription_connected_ = true;
+    break;
+  case Config::GrpcMuxStreamEvent::Closed:
+    if (!subscription_connected_) {
+      return;
+    }
+    subscription_connected_ = false;
+
+    if (context_ == nullptr) {
+      return;
+    }
+
+    context_->mainThreadDispatcher().post(
+        [weak_this = weak_from_this(), subscription_id = subscription_id_]() {
+          if (auto shared_this = weak_this.lock()) {
+            if (subscription_id != shared_this->subscription_id_) {
+              return;
+            }
+            shared_this->maybeRecreateSubscriptionInDesiredMode(/*transport_closed=*/true);
+          }
+        });
+    break;
+  }
+}
+
+void PolicyHostMap::maybeRecreateSubscriptionInDesiredMode(bool transport_closed) {
+  if (subscription_ && (subscription_connected_ || !transport_closed)) {
+    if (subscription_connected_ && subscriptionUseDeltaXds()) {
+      return;
+    }
+    if (Protobuf::util::MessageDifferencer::Equals(config_source_, desired_config_source_)) {
+      return;
+    }
+  }
+
+  subscribe();
+}
+
+absl::Status
+PolicyHostMap::onConfigUpdate(const std::vector<Envoy::Config::DecodedResourceRef>& added_resources,
+                              const Protobuf::RepeatedPtrField<std::string>& removed_resources,
+                              const std::string& system_version_info) {
+  const bool is_new_stream = subscription_id_ != accepted_subscription_id_;
+  ENVOY_LOG(
+      debug,
+      "PolicyHostMap::onConfigUpdate({}), {} added_resources, {} removed_resources, version: {}, "
+      "subscription_id: {}, accepted_subscription_id: {}, is_new_stream: {}",
+      name_, added_resources.size(), removed_resources.size(), system_version_info,
+      subscription_id_, accepted_subscription_id_, is_new_stream);
+
+  auto newmap =
+      std::make_shared<ThreadLocalHostMapInitializer>(is_new_stream ? nullptr : getHostMap());
+
+  absl::flat_hash_set<uint64_t> to_remove;
+  to_remove.reserve(added_resources.size() + removed_resources.size());
+
+  for (const auto& name : removed_resources) {
+    uint64_t nid = 0;
+    auto [ptr, ec] = std::from_chars(name.data(), name.data() + name.size(), nid);
+    if (ec != std::errc{} || ptr != name.data() + name.size()) {
+      throw EnvoyException(fmt::format("Invalid removed resource name '{}'", name));
+    }
+    ENVOY_LOG(trace,
+              "Removing NetworkPolicyHosts for policy {} in delta onConfigUpdate() version {}", nid,
+              system_version_info);
+    to_remove.insert(nid);
+  }
+  for (const auto& resource : added_resources) {
+    const auto& config = dynamic_cast<const cilium::NetworkPolicyHosts&>(resource.get().resource());
+    to_remove.insert(config.policy());
+  }
+  newmap->remove(to_remove);
+
+  for (const auto& resource : added_resources) {
+    const auto& config = dynamic_cast<const cilium::NetworkPolicyHosts&>(resource.get().resource());
+    ENVOY_LOG(trace,
+              "Received NetworkPolicyHosts for policy {} in delta onConfigUpdate() version {}",
+              config.policy(), system_version_info);
+    newmap->insert(config);
+  }
+
+  // Force 'this' to be not deleted for as long as the lambda stays
+  // alive. Note that generally capturing a shared pointer is
+  // dangerous as it may happen that there is a circular reference
+  // from 'this' to itself via the lambda capture, leading to 'this'
+  // never being released. It should happen in this case, though.
+  std::shared_ptr<PolicyHostMap> shared_this = shared_from_this();
+
+  // Assign the new map to all threads.
+  tls_->set([shared_this, newmap](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
+    UNREFERENCED_PARAMETER(shared_this);
+    ENVOY_LOG(trace, "PolicyHostMap: Assigning new map");
+    return newmap;
+  });
+  logmaps("delta onConfigUpdate");
+  accepted_subscription_id_ = subscription_id_;
+  stats_.update_success_.inc();
+  return absl::OkStatus();
 }
 
 absl::Status

@@ -235,14 +235,15 @@ Config::Config(const ::cilium::BpfMetadata& config,
                     config.ipv6_source_address()));
   }
   if (config.use_nphds()) {
-    hosts_ =
-        context.serverFactoryContext().singletonManager().getTyped<const Cilium::PolicyHostMap>(
-            SINGLETON_MANAGER_REGISTERED_NAME(cilium_host_map),
-            [&context, config_source = config_source_] {
-              auto map = std::make_shared<Cilium::PolicyHostMap>(context.serverFactoryContext());
-              map->startSubscription(context.serverFactoryContext(), config_source);
-              return map;
-            });
+    hosts_ = context.serverFactoryContext().singletonManager().getTyped<Cilium::PolicyHostMap>(
+        SINGLETON_MANAGER_REGISTERED_NAME(cilium_host_map),
+        [&context, config_source = config_source_] {
+          auto map = std::make_shared<Cilium::PolicyHostMap>(context.serverFactoryContext());
+          map->startSubscription(context.serverFactoryContext(), config_source);
+          return map;
+        });
+    // update desired config source on the map
+    hosts_->setConfigSource(config_source_);
   }
 
   // Note: all instances use the bpf root of the first filter with non-empty
@@ -279,12 +280,13 @@ Config::Config(const ::cilium::BpfMetadata& config,
   // instances!
   // Only created if either ipcache_ or hosts_ map exists
   if (ipcache_ || hosts_) {
-    npmap_ =
-        context.serverFactoryContext().singletonManager().getTyped<const Cilium::NetworkPolicyMap>(
-            SINGLETON_MANAGER_REGISTERED_NAME(cilium_network_policy),
-            [&context, config_source = config_source_] {
-              return std::make_shared<Cilium::NetworkPolicyMap>(context, config_source, true);
-            });
+    npmap_ = context.serverFactoryContext().singletonManager().getTyped<Cilium::NetworkPolicyMap>(
+        SINGLETON_MANAGER_REGISTERED_NAME(cilium_network_policy),
+        [&context, config_source = config_source_] {
+          return std::make_shared<Cilium::NetworkPolicyMap>(context, config_source, true);
+        });
+    // update desired config source on the map
+    npmap_->setConfigSource(config_source_);
   }
 }
 

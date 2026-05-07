@@ -3,6 +3,7 @@
 #include <fmt/format.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -196,9 +197,13 @@ public:
   NetworkPolicyMap(Server::Configuration::FactoryContext& context,
                    const envoy::config::core::v3::ConfigSource& config_source,
                    bool subscribe = false);
+
   ~NetworkPolicyMap() override;
 
   bool exists(const std::string& endpoint_policy_name) const;
+  bool useDeltaXds() const;
+
+  void setConfigSource(const envoy::config::core::v3::ConfigSource& config_source);
 
   const PolicyInstance& getPolicyInstance(const std::string& endpoint_policy_name,
                                           bool allow_egress) const;
@@ -206,11 +211,23 @@ public:
   static PolicyInstance& getDenyAllPolicy();
   static PolicyInstance& getAllowAllEgressPolicy();
 
+  using SubscriptionFactoryForTest =
+      std::function<std::unique_ptr<Envoy::Config::Subscription>(bool use_delta_xds)>;
+
 protected:
   friend class CiliumNetworkPolicyTest;
   friend struct TestHelper;
   PolicyStats& statsForTest() const;
+  void resetStreamForTest();
+  PolicyInstanceConstSharedPtr
+  getPolicyInstanceSharedForTest(const std::string& endpoint_policy_name) const;
   void startSubscriptionForTest(std::unique_ptr<Envoy::Config::Subscription>&& subscription);
+  void startManagedSubscriptionForTest();
+  void setSubscriptionFactoryForTest(SubscriptionFactoryForTest factory);
+  void onSubscriptionConnectedForTest();
+  void onSubscriptionTransportCloseForTest();
+  bool subscriptionUseDeltaXdsForTest() const;
+  bool subscriptionConnectedForTest() const;
   Envoy::Config::SubscriptionCallbacks& subscriptionCallbacksForTest() const;
 
 private:
