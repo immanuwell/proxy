@@ -1,7 +1,7 @@
-From af2053dc1e3892a9f28d6eebf7f907c3d83ce536 Mon Sep 17 00:00:00 2001
+From f9b8bf87aa135f2f3a8138bf08b04b16e482e222 Mon Sep 17 00:00:00 2001
 From: Tam Mach <sayboras@yahoo.com>
 Date: Sat, 14 Mar 2026 21:00:53 +1100
-Subject: [PATCH] repo: Make yq dependency optional for CI config parsing
+Subject: [PATCH 7/7] repo: Make yq dependency optional for CI config parsing
 
 When yq is unavailable (e.g. in WORKSPACE mode due to aspect_bazel_lib
 hub repo symlink issues), fall back to placeholder container image
@@ -14,7 +14,7 @@ Signed-off-by: Tam Mach <sayboras@yahoo.com>
  1 file changed, 25 insertions(+), 13 deletions(-)
 
 diff --git a/bazel/repo.bzl b/bazel/repo.bzl
-index 561c99b71c..a96fcd3757 100644
+index 561c99b7..a96fcd37 100644
 --- a/bazel/repo.bzl
 +++ b/bazel/repo.bzl
 @@ -66,24 +66,36 @@ def _envoy_repo_impl(repository_ctx):
@@ -68,5 +68,5 @@ index 561c99b71c..a96fcd3757 100644
      api_version_path = repository_ctx.path(repository_ctx.attr.envoy_api_version)
      version = repository_ctx.read(repo_version_path).strip()
 -- 
-2.43.0
+2.54.0
 

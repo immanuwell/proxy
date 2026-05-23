@@ -12,8 +12,8 @@ ENVOY_REPO = "envoy"
 #
 # No other line in this file may have ENVOY_SHA followed by an equals sign!
 #
-# renovate: datasource=github-releases depName=envoyproxy/envoy digestVersion=v1.37.2
-ENVOY_SHA = "5afe27fb338b16d5bb06b3a7198bcd581b4e3dee"
+# renovate: datasource=github-releases depName=envoyproxy/envoy digestVersion=v1.38.0
+ENVOY_SHA = "f1dd21b16c244bda00edfb5ffce577e12d0d2ec2"
 
 # // clang-format off: unexpected @bazel_tools reference, please indirect via a definition in //bazel
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
@@ -43,7 +43,7 @@ git_repository(
         "@//patches:0004-thread_local-reset-slot-in-worker-threads-first.patch",
         "@//patches:0005-http-header-expose-attribute.patch",
         "@//patches:0006-test-integration-Defer-fake-upstream-read-enable-un.patch",
-        "@//patches:0008-repo-Make-yq-dependency-optional-for-CI-config-parsi.patch",
+        "@//patches:0007-repo-Make-yq-dependency-optional-for-CI-config-parsi.patch",
     ],
     # // clang-format off: Envoy's format check: Only repository_locations.bzl may contains URL references
     remote = "https://github.com/envoyproxy/envoy.git",
@@ -126,7 +126,9 @@ go_repository(
     version = "v0.32.0",
 )
 
-envoy_dependency_imports()
+envoy_dependency_imports(
+    cargo_bazel_lockfile = "@//bazel:envoy_dynamic_modules_rust_sdk.Cargo.Bazel.lock",
+)
 
 load("@envoy//bazel:repo.bzl", "envoy_repo")
 
