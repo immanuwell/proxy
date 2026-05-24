@@ -165,6 +165,7 @@ subscribe(const absl::string_view type_url,
       /*target_xds_authority_=*/"",
       /*eds_resources_cache_=*/nullptr, // EDS cache is only used for ADS.
       /*skip_subsequent_node_=*/api_config_source.set_node_on_first_message_only(),
+      /*load_stats_reporter_factory_=*/nullptr,
   };
 
   return std::make_unique<Config::GrpcSubscriptionImpl>(
