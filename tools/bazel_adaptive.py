@@ -25,7 +25,7 @@ Interface and argument handling:
   and when --jobs is absent inserts the adaptive --jobs value immediately before
   that delimiter or at the end of the argument list.
 - Read the action timeout from BAZEL_ADAPTIVE_BUILD_TIMEOUT as a bare positive
-  number of seconds; default to 100 seconds. This applies to builds and tests
+  number of seconds; default to 150 seconds. This applies to builds and tests
   and is independent of Bazel's --test_timeout.
 - Read the low-memory threshold from BAZEL_ADAPTIVE_LOW_MEMORY_THRESHOLD_MB as
   MiB; default to 1024 MiB. Memory is read from /proc/meminfo, using
@@ -92,6 +92,11 @@ Monitoring model:
   BAZEL_ADAPTIVE_IO_STALL_FLOOR_SECONDS, default 10 seconds, the floor is
   halved, rounded up. If that stall evidence remains present, the floor is
   halved again after each additional interval, for example 6 -> 3 -> 2 -> 1.
+  Sustained I/O blocking is based on repeated observations in the current stall
+  window, not a single D-state sighting. The evidence can come from running
+  action groups in D state or heavy swap-in reported by /proc/vmstat. Pausing
+  below the normal floor requires both tight memory and currently sustained I/O
+  blocking.
 - After every fresh process-group scan, enforce the "at least one action group
   running" invariant operationally: if all currently detected action groups are
   wrapper-paused, immediately resume the oldest paused group even when memory is
@@ -101,24 +106,25 @@ Monitoring model:
 - The low-memory reserve is adaptive within the range from the configured base
   threshold to twice that base. It starts at the base threshold, which should let
   the kernel use some swap. If any still-running action group has a process in
-  uninterruptible I/O wait ("D" state), the wrapper treats that as evidence that
-  running jobs are stalling on memory/swap I/O and raises the effective
-  threshold by 256 MiB, up to the 2x cap. Once no running action is stalled, no
-  wrapper-paused actions remain, and memory is healthy, the threshold decays
-  back toward the base in the same small steps. This avoids guessing one static
-  memory threshold while still preventing pause/resume flapping.
+  uninterruptible I/O wait ("D" state), or if /proc/vmstat shows heavy swap-in,
+  the wrapper treats that as evidence that running jobs are stalling on memory
+  pressure and raises the effective threshold by 256 MiB, up to the 2x cap. Once
+  no running action is stalled, no wrapper-paused actions remain, and memory is
+  healthy, the threshold decays back toward the base in the same small steps.
+  This avoids guessing one static memory threshold while still preventing
+  pause/resume flapping.
 - While any wrapper-paused action group is stopped, the progress parser records
   a pause interval. Action-age decisions and forwarded Bazel action-duration
   displays subtract pause overlap from Bazel's displayed action time and from
   wall-clock aging, so an action that Bazel reports as 130s old after being
   paused for 30s is treated and shown as roughly 100s of active runtime for the
-  display. Downscale timeout checks prefer the active runtime of real,
-  non-paused Bazel action process groups, so stopped jobs do not force a lower
-  --jobs retry while active jobs are still making progress. Where possible,
-  duration rewriting is matched to the source files associated with the paused
-  action groups so running action durations continue to advance. Rewritten
-  durations keep Bazel's plain seconds format, for example "100s" rather than
-  "1m40s".
+  display. Downscale timeout checks use the active runtime of real, non-paused
+  Bazel action process groups when that proves all active groups are old, but
+  Bazel's visible action-duration sample can also trigger the timeout path when
+  Bazel caps the displayed action list. Where possible, duration rewriting is
+  matched to the source files associated with the paused action groups so
+  running action durations continue to advance. Rewritten durations keep Bazel's
+  plain seconds format, for example "100s" rather than "1m40s".
 - If pausing is not enough and the normal timeout/low memory condition is
   reached, the existing restart/downscale fallback still applies.
 - When the wrapper starts stopping Bazel for upscale/downscale, first resume
@@ -178,12 +184,17 @@ Monitoring model:
 Downscale behavior:
 - Downscale checks stay active for the whole run and take priority over any
   pending upscale. Low memory alone does not interrupt a progressing build.
-- If the latest progress frame reports at least one running action, all reported
-  running actions are over the action timeout, and the current MemAvailable is
-  below the low-memory threshold, gracefully interrupt Bazel and retry with
-  half as many jobs, rounded up. For example, 12 -> 6, 6 -> 3, 5 -> 3,
-  3 -> 2, and 2 -> 1. Before retrying, wait until memory has recovered to at
-  least half of total memory.
+- If the latest progress frame reports at least one running action, action-age
+  evidence is over the action timeout, and the current MemAvailable is below
+  the effective low-memory threshold, gracefully interrupt Bazel and retry with
+  half as many jobs, rounded up. If the completed action count advanced within
+  the timeout window and the wrapper currently observes no running-action I/O
+  distress, defer this downscale because long action age alone is not failure
+  evidence while the build is still progressing. If action groups are already
+  wrapper-paused, use the higher pause-watch threshold for this gate, because
+  pausing has already proven that the current attempt is under memory pressure.
+  For example, 12 -> 6, 6 -> 3, 5 -> 3, 3 -> 2, and 2 -> 1. Before retrying,
+  wait until memory has recovered to at least half of total memory.
 - If Bazel reports a killed or terminated action, exits with an abrupt server
   failure, or exits while Bazel build processes are still dangling under the
   output base, retry. If the recent rolling average memory is more than half of
@@ -292,7 +303,7 @@ import time
 from dataclasses import dataclass, field
 
 
-DEFAULT_ACTION_TIMEOUT_SECONDS = 100
+DEFAULT_ACTION_TIMEOUT_SECONDS = 150
 BUILD_TIMEOUT_ENV = "BAZEL_ADAPTIVE_BUILD_TIMEOUT"
 
 DEFAULT_LOW_MEMORY_THRESHOLD_MB = 1024
@@ -302,8 +313,11 @@ ADAPTIVE_THRESHOLD_STEP_MB = 256
 ADAPTIVE_THRESHOLD_RAISE_COOLDOWN_SECONDS = 10.0
 ADAPTIVE_THRESHOLD_LOWER_COOLDOWN_SECONDS = 30.0
 
-DEFAULT_IO_STALL_FLOOR_SECONDS = 10
+DEFAULT_IO_STALL_FLOOR_SECONDS = 3
 IO_STALL_FLOOR_SECONDS_ENV = "BAZEL_ADAPTIVE_IO_STALL_FLOOR_SECONDS"
+
+DEFAULT_IO_STALL_SWAP_RATE_MB_PER_SECOND = 32
+IO_STALL_SWAP_RATE_ENV = "BAZEL_ADAPTIVE_IO_STALL_SWAP_RATE_MB_PER_SECOND"
 
 DISPLAY_PAUSE_LABEL_GRACE_SECONDS = 60.0
 DISPLAY_PAUSE_LABEL_HISTORY_LIMIT = 512
@@ -328,12 +342,18 @@ MAX_BAZEL_NICE = 19
 
 DEFAULT_MEMINFO_PATH = "/proc/meminfo"
 MEMINFO_ENV = "BAZEL_ADAPTIVE_MEMINFO"
+DEFAULT_VMSTAT_PATH = "/proc/vmstat"
+VMSTAT_ENV = "BAZEL_ADAPTIVE_VMSTAT"
 
 WRAPPER_START_TIME = time.monotonic()
 try:
     CLOCK_TICKS_PER_SECOND = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 except (AttributeError, KeyError, OSError, ValueError):
     CLOCK_TICKS_PER_SECOND = 100
+try:
+    PAGE_SIZE_KB = max(1, os.sysconf("SC_PAGE_SIZE") // 1024)
+except (AttributeError, OSError, ValueError):
+    PAGE_SIZE_KB = 4
 DEFAULT_ENV_FLAG_VALUE = ""
 
 FORCE_PTY_ENV = "BAZEL_ADAPTIVE_FORCE_PTY"
@@ -360,6 +380,7 @@ MEMORY_REPORT_SECONDS = 30.0
 UPSCALE_MAX_ACTION_SECONDS = 15
 UPSCALE_REMAINING_ACTION_FINISH_JOBS_MULTIPLIER = 2
 RECENT_STALL_SECONDS = 30.0
+TIMEOUT_DOWNSCALE_DEFER_REPORT_SECONDS = 30.0
 DANGLING_PROCESS_TERM_WAIT_SECONDS = 3.0
 DANGLING_PROCESS_KILL_WAIT_SECONDS = 1.0
 BAZEL_SHUTDOWN_MIN_TIMEOUT_SECONDS = 1
@@ -370,6 +391,8 @@ THROTTLE_IDLE_PAUSE_CHECK_SECONDS = 0.5
 THROTTLE_RESUME_CHECK_SECONDS = 5.0
 RESUME_IO_STALL_CLEAR_SECONDS = THROTTLE_RESUME_CHECK_SECONDS
 RESUME_MEMORY_SETTLE_SECONDS = THROTTLE_RESUME_CHECK_SECONDS
+IO_STALL_RECENT_OBSERVATION_SECONDS = 1.0
+IO_STALL_MIN_OBSERVATIONS = 2
 
 # Use: split Bazel output into progress frames. Bazel can update progress with
 # either newline or carriage-return records; splitting on both lets the parser
@@ -591,6 +614,11 @@ class MemInfo:
 
 
 @dataclass
+class SwapIo:
+    pages_in: int
+
+
+@dataclass
 class ParsedArgs:
     original_args: list[str]
     initial_jobs: int
@@ -759,6 +787,17 @@ def io_stall_floor_seconds(env: dict[str, str] | None = None) -> int:
     return seconds
 
 
+def io_stall_swap_rate_kb_per_second(env: dict[str, str] | None = None) -> int:
+    value = (env or os.environ).get(IO_STALL_SWAP_RATE_ENV)
+    if value is None:
+        return DEFAULT_IO_STALL_SWAP_RATE_MB_PER_SECOND * 1024
+
+    rate_mb = positive_int(value)
+    if rate_mb is None:
+        raise ValueError(f"{IO_STALL_SWAP_RATE_ENV} must be a positive integer")
+    return rate_mb * 1024
+
+
 # Return the index of Bazel's "--" delimiter, or the end of args if absent.
 def bazel_option_end(args: list[str]) -> int:
     try:
@@ -835,6 +874,7 @@ class ProgressFrameParser:
         self.running_count: int | None = None
         self.running_count_decreased = False
         self.completed_count: int | None = None
+        self.completed_count_advanced_at: float | None = None
         self.total_count: int | None = None
         self.meaningful_work_done = False
         self.action_durations: list[ObservedActionDuration] = []
@@ -890,6 +930,7 @@ class ProgressFrameParser:
                 completed_count = int(progress_match.group("done").replace(",", ""))
                 if self.completed_count is not None and completed_count > self.completed_count:
                     self.meaningful_work_done = True
+                    self.completed_count_advanced_at = now
                 self.completed_count = completed_count
 
                 total = progress_match.group("total")
@@ -1142,6 +1183,12 @@ class ProgressFrameParser:
         reported_action_durations = durations[: self.running_count]
         return all(duration > limit_seconds for duration in reported_action_durations)
 
+    def completed_progress_recent(self, now: float, window_seconds: float) -> bool:
+        return (
+            self.completed_count_advanced_at is not None
+            and now - self.completed_count_advanced_at <= window_seconds
+        )
+
     def has_running_actions(self) -> bool:
         if self.running_count is not None:
             return self.running_count > 0
@@ -1227,6 +1274,23 @@ def read_meminfo(path: str | None = None) -> MemInfo:
         total_kb=values.get("MemTotal", 0),
         available_kb=values.get("MemAvailable", values.get("MemFree", 0)),
     )
+
+
+def read_swap_io(path: str | None = None) -> SwapIo:
+    values: dict[str, int] = {}
+    vmstat_path = path or os.environ.get(VMSTAT_ENV, DEFAULT_VMSTAT_PATH)
+    with open(vmstat_path, encoding="utf-8") as vmstat:
+        for line in vmstat:
+            fields = line.split()
+            if len(fields) != 2:
+                continue
+            if fields[0] != "pswpin":
+                continue
+            try:
+                values[fields[0]] = int(fields[1])
+            except ValueError:
+                continue
+    return SwapIo(pages_in=values.get("pswpin", 0))
 
 
 # Increase jobs by 1.5x, rounded up and capped at the initial maximum.
@@ -2115,10 +2179,15 @@ class ActionThrottler:
         self.next_threshold_lower_at = 0.0
         self.max_observed_action_groups = 0
         self.io_stall_floor_seconds = io_stall_floor_seconds()
+        self.io_stall_swap_rate_kb_per_second = io_stall_swap_rate_kb_per_second()
         self.io_stall_started_at: float | None = None
+        self.io_stall_observations: list[tuple[float, bool]] = []
+        self.current_io_stall_observed = False
         self.io_stall_floor_groups: int | None = None
         self.next_io_stall_floor_drop_at: float | None = None
         self.last_running_io_stall_at: float | None = None
+        self.last_swap_io_sample: tuple[float, SwapIo] | None = None
+        self.last_swap_io_rate_kb_per_second = 0.0
         self.next_normal_resume_at = 0.0
 
     def paused_count(self) -> int:
@@ -2154,6 +2223,71 @@ class ActionThrottler:
         groups: list[ActionProcessGroup],
     ) -> list[ActionProcessGroup]:
         return [group for group in self.running_action_groups(groups) if "D" in group.states]
+
+    def swap_io_is_heavy(self, now: float) -> bool:
+        try:
+            current = read_swap_io()
+        except OSError:
+            return False
+
+        previous = self.last_swap_io_sample
+        self.last_swap_io_sample = (now, current)
+        if previous is None:
+            return False
+
+        previous_at, previous_sample = previous
+        elapsed = now - previous_at
+        if elapsed <= 0:
+            return False
+
+        pages_in = max(0, current.pages_in - previous_sample.pages_in)
+        self.last_swap_io_rate_kb_per_second = pages_in * PAGE_SIZE_KB / elapsed
+        return self.last_swap_io_rate_kb_per_second >= self.io_stall_swap_rate_kb_per_second
+
+    def io_stall_reason(self, stalled_running: list[ActionProcessGroup]) -> str:
+        if stalled_running:
+            return (
+                f"{len(stalled_running)} running action group(s) "
+                "in uninterruptible I/O"
+            )
+        return (
+            "swap-in at "
+            f"{int(self.last_swap_io_rate_kb_per_second // 1024)} MiB/s"
+        )
+
+    def record_io_stall_observation(self, now: float, stalled: bool) -> None:
+        self.current_io_stall_observed = stalled
+        self.io_stall_observations.append((now, stalled))
+        cutoff = now - self.io_stall_floor_seconds * 2
+        self.io_stall_observations = [
+            observation
+            for observation in self.io_stall_observations
+            if observation[0] >= cutoff
+        ]
+        if stalled:
+            self.last_running_io_stall_at = now
+            if self.io_stall_started_at is None:
+                self.io_stall_started_at = now
+        elif not self.recent_io_stall_observed(now):
+            self.io_stall_started_at = None
+
+    def recent_io_stall_observed(self, now: float) -> bool:
+        return (
+            self.last_running_io_stall_at is not None
+            and now - self.last_running_io_stall_at <= IO_STALL_RECENT_OBSERVATION_SECONDS
+        )
+
+    def sustained_io_stall_observed(self, now: float) -> bool:
+        if self.io_stall_started_at is None:
+            return False
+        if now - self.io_stall_started_at < self.io_stall_floor_seconds:
+            return False
+        if not self.current_io_stall_observed:
+            return False
+        stalled_observations = sum(
+            1 for _observed_at, stalled in self.io_stall_observations if stalled
+        )
+        return stalled_observations >= IO_STALL_MIN_OBSERVATIONS
 
     def group_active_elapsed_seconds(
         self,
@@ -2197,13 +2331,18 @@ class ActionThrottler:
     def pause_watch_threshold_kb(self) -> int:
         return self.low_memory_threshold_kb() * 2
 
+    def downscale_memory_threshold_kb(self) -> int:
+        if self.paused_count() > 0:
+            return self.pause_watch_threshold_kb()
+        return self.low_memory_threshold_kb()
+
     def maybe_adapt_threshold(self, groups: list[ActionProcessGroup], meminfo: MemInfo) -> None:
         now = time.monotonic()
         stalled_running = self.stalled_running_groups(groups)
-        if stalled_running:
-            self.last_running_io_stall_at = now
-            if self.io_stall_started_at is None:
-                self.io_stall_started_at = now
+        swap_io_stalled = self.swap_io_is_heavy(now)
+        io_stalled = bool(stalled_running) or swap_io_stalled
+        self.record_io_stall_observation(now, io_stalled)
+        if io_stalled:
             self.maybe_lower_io_stall_floor(groups, now)
             if (
                 self.effective_threshold_kb < self.max_threshold_kb
@@ -2224,19 +2363,20 @@ class ActionThrottler:
                     "raising low-memory threshold from "
                     f"{old_mb} to {self.effective_threshold_kb // 1024} MiB "
                     "after observing "
-                    f"{len(stalled_running)} running action group(s) in uninterruptible I/O"
+                    f"{self.io_stall_reason(stalled_running)}"
                 )
             return
 
-        if self.io_stall_started_at is not None or self.io_stall_floor_groups is not None:
-            self.io_stall_started_at = None
-            if self.io_stall_floor_groups is not None:
-                self.io_stall_floor_groups = None
-                self.next_io_stall_floor_drop_at = None
-                diag(
-                    "uninterruptible I/O cleared; restoring normal pause floor of "
-                    f"{self.minimum_running_groups(len(groups))} running action group(s)"
-                )
+        if (
+            not self.sustained_io_stall_observed(now)
+            and self.io_stall_floor_groups is not None
+        ):
+            self.io_stall_floor_groups = None
+            self.next_io_stall_floor_drop_at = None
+            diag(
+                "uninterruptible I/O cleared; restoring normal pause floor of "
+                f"{self.minimum_running_groups(len(groups))} running action group(s)"
+            )
 
         if self.effective_threshold_kb <= self.base_threshold_kb:
             return
@@ -2271,9 +2411,7 @@ class ActionThrottler:
         groups: list[ActionProcessGroup],
         now: float,
     ) -> None:
-        if self.io_stall_started_at is None:
-            return
-        if now - self.io_stall_started_at < self.io_stall_floor_seconds:
+        if not self.sustained_io_stall_observed(now):
             return
         if (
             self.next_io_stall_floor_drop_at is not None
@@ -2415,12 +2553,20 @@ class ActionThrottler:
             return
 
         next_pause_number = len(self.paused_keys) + 1
-        if meminfo.available_kb > self.pause_threshold_kb(len(groups), next_pause_number):
+        now = time.monotonic()
+        stall_floor_active = (
+            self.io_stall_floor_groups is not None
+            and self.sustained_io_stall_observed(now)
+        )
+        if (
+            not stall_floor_active
+            and meminfo.available_kb > self.pause_threshold_kb(len(groups), next_pause_number)
+        ):
             return
 
         selected = max(running, key=self.group_sort_key)
         self.signal_group(selected, signal.SIGSTOP)
-        self.remember_paused_group(selected, time.monotonic())
+        self.remember_paused_group(selected, now)
 
     def resume_if_needed(self, meminfo: MemInfo | None) -> bool:
         if meminfo is None:
@@ -2504,6 +2650,47 @@ class ActionThrottler:
                 pass
             except PermissionError:
                 pass
+
+
+def action_timeout_evidence(
+    parser: ProgressFrameParser,
+    action_throttler: ActionThrottler,
+    limit_seconds: int,
+    now: float,
+) -> tuple[bool, str]:
+    running_groups_over_timeout_fn = getattr(
+        action_throttler,
+        "all_running_action_groups_over",
+        None,
+    )
+    running_groups_over_timeout = (
+        running_groups_over_timeout_fn(limit_seconds, now)
+        if running_groups_over_timeout_fn is not None
+        else None
+    )
+    if running_groups_over_timeout:
+        return True, "all active Bazel action groups"
+    if parser.all_reported_actions_over(limit_seconds, now):
+        return True, "all reported running actions"
+    return False, "action-age evidence"
+
+
+def timeout_downscale_defer_reason(
+    parser: ProgressFrameParser,
+    action_throttler: ActionThrottler,
+    limit_seconds: int,
+    now: float,
+) -> str | None:
+    if not parser.completed_progress_recent(now, limit_seconds):
+        return None
+    if action_throttler.recent_io_stall_observed(now):
+        return None
+    if action_throttler.current_io_stall_observed:
+        return None
+    return (
+        "completed action count advanced recently and no running action "
+        "I/O stall is currently observed"
+    )
 
 
 # Lower scheduler priority for Bazel action children that the server launches.
@@ -2738,6 +2925,7 @@ def run_once(
     next_renice_check = now
     next_pause_check = now
     next_resume_check = now
+    next_downscale_defer_report = now
     memory_tightness_observed = False
     memory_kill_resume_done = False
     user_termination_resume_done = False
@@ -3096,52 +3284,66 @@ def run_once(
                         return result(normalize_returncode(returncode), stop_reason)
                 continue
 
+            downscale_memory_threshold_fn = getattr(
+                action_throttler,
+                "downscale_memory_threshold_kb",
+                None,
+            )
+            downscale_memory_threshold_kb = (
+                downscale_memory_threshold_fn()
+                if downscale_memory_threshold_fn is not None
+                else low_memory_threshold_kb()
+            )
             if (
                 jobs > 1
                 and meminfo is not None
-                and meminfo.available_kb < low_memory_threshold_kb()
+                and meminfo.available_kb < downscale_memory_threshold_kb
             ):
-                running_groups_over_timeout_fn = getattr(
+                running_actions_over_timeout, timeout_subject = action_timeout_evidence(
+                    parser,
                     action_throttler,
-                    "all_running_action_groups_over",
-                    None,
-                )
-                running_groups_over_timeout = (
-                    running_groups_over_timeout_fn(parsed.action_timeout, now)
-                    if running_groups_over_timeout_fn is not None
-                    else None
-                )
-                running_actions_over_timeout = (
-                    running_groups_over_timeout
-                    if running_groups_over_timeout is not None
-                    else parser.all_reported_actions_over(parsed.action_timeout, now)
+                    parsed.action_timeout,
+                    now,
                 )
                 if running_actions_over_timeout:
-                    terminal.restore()
-                    paused_count = action_throttler.paused_count()
-                    action_throttler.resume_all("before stopping Bazel for downscale")
-                    update_pause_accounting(paused_count)
-                    if running_groups_over_timeout is None:
-                        timeout_subject = "all reported running actions"
+                    defer_reason = timeout_downscale_defer_reason(
+                        parser,
+                        action_throttler,
+                        parsed.action_timeout,
+                        now,
+                    )
+                    if defer_reason is not None:
+                        if now >= next_downscale_defer_report:
+                            diag(
+                                "downscale deferred despite old action-age evidence: "
+                                f"{defer_reason}"
+                            )
+                            next_downscale_defer_report = (
+                                now + TIMEOUT_DOWNSCALE_DEFER_REPORT_SECONDS
+                            )
                     else:
-                        timeout_subject = "all active Bazel action groups"
-                    reason = (
-                        f"{timeout_subject} are over {parsed.action_timeout}s "
-                        "and memory is low "
-                        f"({meminfo.available_kb // 1024} MiB available)"
-                    )
-                    graceful_stop(process, reason)
-                    stop_reason = "down"
-                    stop_deadline = now + parsed.action_timeout
-                    diag(
-                        "downscale decision used "
-                        f"{timeout_subject}; {paused_count} action group(s) were paused"
-                    )
-                    diag(
-                        "action timeout and low memory detected; "
-                        "retrying with fewer jobs"
-                    )
-                    continue
+                        terminal.restore()
+                        paused_count = action_throttler.paused_count()
+                        action_throttler.resume_all("before stopping Bazel for downscale")
+                        update_pause_accounting(paused_count)
+                        reason = (
+                            f"{timeout_subject} are over {parsed.action_timeout}s "
+                            "and memory is low "
+                            f"({meminfo.available_kb // 1024} MiB available; "
+                            f"threshold {downscale_memory_threshold_kb // 1024} MiB)"
+                        )
+                        graceful_stop(process, reason)
+                        stop_reason = "down"
+                        stop_deadline = now + parsed.action_timeout
+                        diag(
+                            "downscale decision used "
+                            f"{timeout_subject}; {paused_count} action group(s) were paused"
+                        )
+                        diag(
+                            "action timeout and low memory detected; "
+                            "retrying with fewer jobs"
+                        )
+                        continue
 
             if pending_upscale_next_jobs is not None:
                 upscale_reevaluation_count += 1

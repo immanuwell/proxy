@@ -75,7 +75,7 @@ class ParsingTest(unittest.TestCase):
             bazel_adaptive.build_timeout_from_env({"BAZEL_ADAPTIVE_BUILD_TIMEOUT": "17"}),
             17,
         )
-        self.assertEqual(bazel_adaptive.build_timeout_from_env({}), 100)
+        self.assertEqual(bazel_adaptive.build_timeout_from_env({}), 150)
         with self.assertRaises(ValueError):
             bazel_adaptive.build_timeout_from_env({"BAZEL_ADAPTIVE_BUILD_TIMEOUT": "1m"})
 
@@ -475,6 +475,29 @@ class ProgressFrameTest(unittest.TestCase):
 
         self.assertTrue(parser.all_reported_actions_over(10))
 
+    def test_visible_timeout_evidence_can_override_young_process_group_sample(self) -> None:
+        class YoungGroupSample:
+            def all_running_action_groups_over(self, _limit_seconds: int, _now: float) -> bool:
+                return False
+
+        parser = bazel_adaptive.ProgressFrameParser()
+        parser.feed(
+            "[5,617 / 5,640] 3 / 15 tests; 9 actions, 6 running\n"
+            "    Compiling tests/cilium_network_policy_test.cc; "
+            "252s processwrapper-sandbox\n",
+            now=0.0,
+        )
+
+        has_evidence, subject = bazel_adaptive.action_timeout_evidence(
+            parser,
+            YoungGroupSample(),
+            100,
+            0.0,
+        )
+
+        self.assertTrue(has_evidence)
+        self.assertEqual(subject, "all reported running actions")
+
     def test_partial_action_line_with_duration_counts_for_downscale(self) -> None:
         parser = bazel_adaptive.ProgressFrameParser()
         parser.feed("[1 / 4] 2 actions, 2 running\n", now=0.0)
@@ -649,6 +672,22 @@ class ProgressFrameTest(unittest.TestCase):
 
         self.assertTrue(parser.meaningful_work_done)
         self.assertIsNone(parser.upscale_action_skip_reason(15, 2, now=0.0))
+
+    def test_recent_completed_progress_is_tracked(self) -> None:
+        parser = bazel_adaptive.ProgressFrameParser()
+        parser.feed(
+            "[9,890 / 10,553] Compiling a.cc; 1s processwrapper-sandbox "
+            "... (13 actions, 12 running)\n",
+            now=10.0,
+        )
+        parser.feed(
+            "[9,891 / 10,553] Compiling b.cc; 1s processwrapper-sandbox "
+            "... (13 actions, 12 running)\n",
+            now=20.0,
+        )
+
+        self.assertTrue(parser.completed_progress_recent(now=50.0, window_seconds=31.0))
+        self.assertFalse(parser.completed_progress_recent(now=52.0, window_seconds=31.0))
 
     def test_mid_build_running_count_fluctuation_is_not_winding_down(self) -> None:
         parser = bazel_adaptive.ProgressFrameParser()
@@ -1813,6 +1852,22 @@ class MemoryTest(unittest.TestCase):
             bazel_adaptive.os.kill = old_kill
             sys.stderr = old_stderr
 
+    def test_downscale_memory_threshold_uses_pause_watch_threshold_when_paused(self) -> None:
+        with temporary_env("BAZEL_ADAPTIVE_LOW_MEMORY_THRESHOLD_MB", "1024"):
+            throttler = bazel_adaptive.ActionThrottler(
+                bazel_adaptive.BuildContext("/tmp/work")
+            )
+
+            self.assertEqual(
+                throttler.downscale_memory_threshold_kb(),
+                1024 * 1024,
+            )
+            throttler.paused_keys = {"processwrapper-sandbox/1"}
+            self.assertEqual(
+                throttler.downscale_memory_threshold_kb(),
+                2 * 1024 * 1024,
+            )
+
     def test_running_action_group_timeout_ignores_paused_groups(self) -> None:
         old_build_process_groups = bazel_adaptive.build_process_groups
         old_monotonic = bazel_adaptive.time.monotonic
@@ -1853,6 +1908,50 @@ class MemoryTest(unittest.TestCase):
         finally:
             bazel_adaptive.build_process_groups = old_build_process_groups
             bazel_adaptive.time.monotonic = old_monotonic
+
+    def test_timeout_downscale_defers_after_recent_progress_without_io_stall(self) -> None:
+        parser = bazel_adaptive.ProgressFrameParser()
+        parser.feed(
+            "[5,617 / 5,640] 3 / 15 tests; Compiling a.cc; "
+            "101s processwrapper-sandbox ... (9 actions, 6 running)\n",
+            now=1000.0,
+        )
+        parser.feed(
+            "[5,618 / 5,640] 3 / 15 tests; Compiling b.cc; "
+            "101s processwrapper-sandbox ... (9 actions, 6 running)\n",
+            now=1010.0,
+        )
+        throttler = bazel_adaptive.ActionThrottler(bazel_adaptive.BuildContext("/tmp/work"))
+
+        self.assertTrue(
+            bazel_adaptive.action_timeout_evidence(parser, throttler, 100, 1010.0)[0]
+        )
+        self.assertIsNotNone(
+            bazel_adaptive.timeout_downscale_defer_reason(parser, throttler, 100, 1010.0)
+        )
+
+        throttler.current_io_stall_observed = True
+        self.assertIsNone(
+            bazel_adaptive.timeout_downscale_defer_reason(parser, throttler, 100, 1010.0)
+        )
+
+    def test_timeout_downscale_does_not_defer_after_progress_gets_old(self) -> None:
+        parser = bazel_adaptive.ProgressFrameParser()
+        parser.feed(
+            "[5,617 / 5,640] 3 / 15 tests; Compiling a.cc; "
+            "101s processwrapper-sandbox ... (9 actions, 6 running)\n",
+            now=1000.0,
+        )
+        parser.feed(
+            "[5,618 / 5,640] 3 / 15 tests; Compiling b.cc; "
+            "101s processwrapper-sandbox ... (9 actions, 6 running)\n",
+            now=1010.0,
+        )
+        throttler = bazel_adaptive.ActionThrottler(bazel_adaptive.BuildContext("/tmp/work"))
+
+        self.assertIsNone(
+            bazel_adaptive.timeout_downscale_defer_reason(parser, throttler, 100, 1111.0)
+        )
 
     def test_action_throttler_halves_floor_after_sustained_io_stall(self) -> None:
         old_build_process_groups = bazel_adaptive.build_process_groups
@@ -1958,6 +2057,137 @@ class MemoryTest(unittest.TestCase):
             bazel_adaptive.build_process_groups = old_build_process_groups
             bazel_adaptive.os.kill = old_kill
             bazel_adaptive.time.monotonic = old_monotonic
+            sys.stderr = old_stderr
+
+    def test_action_throttler_resets_io_stall_window_when_blocking_clears(self) -> None:
+        old_build_process_groups = bazel_adaptive.build_process_groups
+        old_kill = bazel_adaptive.os.kill
+        old_stderr = sys.stderr
+        old_monotonic = bazel_adaptive.time.monotonic
+        signals: list[tuple[int, int]] = []
+        now = 0.0
+        stalled = True
+
+        def groups() -> list[bazel_adaptive.ActionProcessGroup]:
+            states = {"D"} if stalled else {"R"}
+            return [
+                bazel_adaptive.ActionProcessGroup(
+                    f"group-{index}",
+                    [940 + index],
+                    index,
+                    states=states,
+                )
+                for index in range(12)
+            ]
+
+        try:
+            sys.stderr = io.StringIO()
+            bazel_adaptive.build_process_groups = lambda _context: groups()
+            bazel_adaptive.os.kill = lambda pid, sig: signals.append((pid, sig))
+            bazel_adaptive.time.monotonic = lambda: now
+            with temporary_env("BAZEL_ADAPTIVE_LOW_MEMORY_THRESHOLD_MB", "1024"):
+                throttler = bazel_adaptive.ActionThrottler(
+                    bazel_adaptive.BuildContext("/tmp/work")
+                )
+
+                for _ in range(20):
+                    throttler.pause_if_needed(
+                        bazel_adaptive.MemInfo(
+                            total_kb=8 * 1024 * 1024,
+                            available_kb=512 * 1024,
+                        )
+                    )
+                self.assertEqual(throttler.io_stall_started_at, 0.0)
+
+                now = 4.9
+                stalled = False
+                throttler.pause_if_needed(
+                    bazel_adaptive.MemInfo(
+                        total_kb=8 * 1024 * 1024,
+                        available_kb=512 * 1024,
+                    )
+                )
+                self.assertIsNone(throttler.io_stall_started_at)
+
+                now = 11.0
+                stalled = True
+                for _ in range(20):
+                    throttler.pause_if_needed(
+                        bazel_adaptive.MemInfo(
+                            total_kb=8 * 1024 * 1024,
+                            available_kb=512 * 1024,
+                        )
+                    )
+
+            self.assertIsNone(throttler.io_stall_floor_groups)
+            self.assertEqual(len(groups()) - len(throttler.paused_keys), 6)
+        finally:
+            bazel_adaptive.build_process_groups = old_build_process_groups
+            bazel_adaptive.os.kill = old_kill
+            bazel_adaptive.time.monotonic = old_monotonic
+            sys.stderr = old_stderr
+
+    def test_action_throttler_halves_floor_after_sustained_swap_io(self) -> None:
+        old_build_process_groups = bazel_adaptive.build_process_groups
+        old_kill = bazel_adaptive.os.kill
+        old_stderr = sys.stderr
+        old_monotonic = bazel_adaptive.time.monotonic
+        old_read_swap_io = bazel_adaptive.read_swap_io
+        signals: list[tuple[int, int]] = []
+        now = 0.0
+        groups = [
+            bazel_adaptive.ActionProcessGroup(f"group-{index}", [960 + index], index)
+            for index in range(12)
+        ]
+
+        def fake_swap_io() -> bazel_adaptive.SwapIo:
+            return bazel_adaptive.SwapIo(pages_in=int(now * 20000))
+
+        try:
+            sys.stderr = io.StringIO()
+            bazel_adaptive.build_process_groups = lambda _context: groups
+            bazel_adaptive.os.kill = lambda pid, sig: signals.append((pid, sig))
+            bazel_adaptive.time.monotonic = lambda: now
+            bazel_adaptive.read_swap_io = fake_swap_io
+            with temporary_env("BAZEL_ADAPTIVE_LOW_MEMORY_THRESHOLD_MB", "1024"):
+                throttler = bazel_adaptive.ActionThrottler(
+                    bazel_adaptive.BuildContext("/tmp/work")
+                )
+
+                now = 0.0
+                throttler.pause_if_needed(
+                    bazel_adaptive.MemInfo(
+                        total_kb=8 * 1024 * 1024,
+                        available_kb=512 * 1024,
+                    )
+                )
+                now = 1.0
+                for _ in range(20):
+                    throttler.pause_if_needed(
+                        bazel_adaptive.MemInfo(
+                            total_kb=8 * 1024 * 1024,
+                            available_kb=512 * 1024,
+                        )
+                    )
+                self.assertEqual(len(groups) - len(throttler.paused_keys), 6)
+
+                now = 11.5
+                for _ in range(20):
+                    throttler.pause_if_needed(
+                        bazel_adaptive.MemInfo(
+                            total_kb=8 * 1024 * 1024,
+                            available_kb=512 * 1024,
+                        )
+                    )
+                    now += 0.1
+
+            self.assertEqual(throttler.io_stall_floor_groups, 3)
+            self.assertEqual(len(groups) - len(throttler.paused_keys), 3)
+        finally:
+            bazel_adaptive.build_process_groups = old_build_process_groups
+            bazel_adaptive.os.kill = old_kill
+            bazel_adaptive.time.monotonic = old_monotonic
+            bazel_adaptive.read_swap_io = old_read_swap_io
             sys.stderr = old_stderr
 
     def test_action_throttler_never_pauses_the_last_running_group(self) -> None:
