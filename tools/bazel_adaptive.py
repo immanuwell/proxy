@@ -24,6 +24,11 @@ Interface and argument handling:
   options. It only scans arguments before Bazel's "--" delimiter for --jobs,
   and when --jobs is absent inserts the adaptive --jobs value immediately before
   that delimiter or at the end of the argument list.
+- Only adapt commands that accept --jobs: build, test, run, coverage, fetch,
+  cquery, and aquery. Other Bazel commands are exec'd directly without adding or
+  rewriting --jobs, so the wrapper can be used as a general Bazel entry point.
+  The detector is conservative around unknown startup options with separate
+  values; ambiguous commands pass through unchanged.
 - Read the action timeout from BAZEL_ADAPTIVE_BUILD_TIMEOUT as a bare positive
   number of seconds; default to 150 seconds. This applies to builds and tests
   and is independent of Bazel's --test_timeout.
@@ -305,6 +310,8 @@ from dataclasses import dataclass, field
 
 DEFAULT_ACTION_TIMEOUT_SECONDS = 150
 BUILD_TIMEOUT_ENV = "BAZEL_ADAPTIVE_BUILD_TIMEOUT"
+
+JOBS_COMMANDS = frozenset({"build", "test", "run", "coverage", "fetch", "cquery", "aquery"})
 
 DEFAULT_LOW_MEMORY_THRESHOLD_MB = 1024
 LOW_MEMORY_THRESHOLD_ENV = "BAZEL_ADAPTIVE_LOW_MEMORY_THRESHOLD_MB"
@@ -624,6 +631,7 @@ class ParsedArgs:
     initial_jobs: int
     action_timeout: int
     job_locations: list[tuple[str, int]]
+    supports_jobs: bool
 
 
 @dataclass
@@ -806,27 +814,44 @@ def bazel_option_end(args: list[str]) -> int:
         return len(args)
 
 
+def bazel_command_supports_jobs(args: list[str]) -> bool:
+    end = bazel_option_end(args)
+    skip_possible_option_value = False
+    for arg in args[:end]:
+        if skip_possible_option_value:
+            skip_possible_option_value = False
+            continue
+        if arg.startswith("-"):
+            if "=" not in arg:
+                skip_possible_option_value = True
+            continue
+        return arg in JOBS_COMMANDS
+    return False
+
+
 # Parse Bazel arguments enough to find the initial jobs cap.
 def parse_bazel_args(args: list[str], action_timeout: int | None = None) -> ParsedArgs:
     initial_jobs = None
     job_locations: list[tuple[str, int]] = []
+    supports_jobs = bazel_command_supports_jobs(args)
 
     end = bazel_option_end(args)
-    i = 0
-    while i < end:
-        arg = args[i]
-        if arg.startswith("--jobs="):
-            job_locations.append(("equals", i))
-            parsed = jobs_value(arg.split("=", 1)[1])
-            if parsed is not None:
-                initial_jobs = parsed
-        elif arg == "--jobs" and i + 1 < end:
-            job_locations.append(("separate", i))
-            parsed = jobs_value(args[i + 1])
-            if parsed is not None:
-                initial_jobs = parsed
+    if supports_jobs:
+        i = 0
+        while i < end:
+            arg = args[i]
+            if arg.startswith("--jobs="):
+                job_locations.append(("equals", i))
+                parsed = jobs_value(arg.split("=", 1)[1])
+                if parsed is not None:
+                    initial_jobs = parsed
+            elif arg == "--jobs" and i + 1 < end:
+                job_locations.append(("separate", i))
+                parsed = jobs_value(args[i + 1])
+                if parsed is not None:
+                    initial_jobs = parsed
+                i += 1
             i += 1
-        i += 1
 
     if initial_jobs is None:
         initial_jobs = os.cpu_count() or 1
@@ -838,12 +863,15 @@ def parse_bazel_args(args: list[str], action_timeout: int | None = None) -> Pars
         initial_jobs=initial_jobs,
         action_timeout=action_timeout,
         job_locations=job_locations,
+        supports_jobs=supports_jobs,
     )
 
 
 # Return Bazel args with this attempt's concrete --jobs value applied.
 def bazel_args_with_jobs(parsed: ParsedArgs, jobs: int) -> list[str]:
     bazel_args = list(parsed.original_args)
+    if not parsed.supports_jobs:
+        return bazel_args
     if parsed.job_locations:
         for kind, index in parsed.job_locations:
             if kind == "equals":
@@ -3406,6 +3434,9 @@ def run_once(
 
 # Retry Bazel attempts while adapting the current jobs value.
 def run_adaptive(bazel_path: str, parsed: ParsedArgs) -> int:
+    if not parsed.supports_jobs:
+        os.execvpe(bazel_path, [bazel_path, *parsed.original_args], os.environ)
+
     jobs = parsed.initial_jobs
     max_jobs = parsed.initial_jobs
     context = BuildContext(os.getcwd())
@@ -3575,6 +3606,9 @@ def main(argv: list[str]) -> int:
             flush=True,
         )
         return normalize_returncode(exit_code)
+
+    if not bazel_command_supports_jobs(argv):
+        os.execvpe(bazel_path, [bazel_path, *argv], os.environ)
 
     try:
         action_timeout = build_timeout_from_env()

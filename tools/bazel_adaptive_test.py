@@ -183,6 +183,68 @@ class ParsingTest(unittest.TestCase):
             ["run", "//tool", "--jobs=7", "--", "--jobs=2"],
         )
 
+    def test_does_not_add_jobs_to_commands_without_jobs_flag(self) -> None:
+        parsed = bazel_adaptive.parse_bazel_args(
+            ["query", "deps(//tests:all)"],
+            action_timeout=100,
+        )
+
+        self.assertFalse(parsed.supports_jobs)
+        self.assertEqual(parsed.job_locations, [])
+        self.assertEqual(
+            bazel_adaptive.bazel_args_with_jobs(parsed, 7),
+            ["query", "deps(//tests:all)"],
+        )
+
+    def test_unknown_commands_pass_through_without_jobs(self) -> None:
+        parsed = bazel_adaptive.parse_bazel_args(
+            ["future-command", "--some_flag"],
+            action_timeout=100,
+        )
+
+        self.assertFalse(parsed.supports_jobs)
+        self.assertEqual(
+            bazel_adaptive.bazel_args_with_jobs(parsed, 7),
+            ["future-command", "--some_flag"],
+        )
+
+    def test_does_not_rewrite_jobs_on_commands_without_jobs_flag(self) -> None:
+        parsed = bazel_adaptive.parse_bazel_args(
+            ["query", "--jobs=99", "deps(//tests:all)"],
+            action_timeout=100,
+        )
+
+        self.assertFalse(parsed.supports_jobs)
+        self.assertEqual(parsed.job_locations, [])
+        self.assertEqual(
+            bazel_adaptive.bazel_args_with_jobs(parsed, 7),
+            ["query", "--jobs=99", "deps(//tests:all)"],
+        )
+
+    def test_recognizes_jobs_commands_after_startup_options(self) -> None:
+        parsed = bazel_adaptive.parse_bazel_args(
+            ["--future_startup_option", "value", "aquery", "//tests:all"],
+            action_timeout=100,
+        )
+
+        self.assertTrue(parsed.supports_jobs)
+        self.assertEqual(
+            bazel_adaptive.bazel_args_with_jobs(parsed, 7),
+            ["--future_startup_option", "value", "aquery", "//tests:all", "--jobs=7"],
+        )
+
+    def test_jobs_command_word_as_possible_startup_option_value_passes_through(self) -> None:
+        parsed = bazel_adaptive.parse_bazel_args(
+            ["--future_startup_option", "run"],
+            action_timeout=100,
+        )
+
+        self.assertFalse(parsed.supports_jobs)
+        self.assertEqual(
+            bazel_adaptive.bazel_args_with_jobs(parsed, 7),
+            ["--future_startup_option", "run"],
+        )
+
     def test_duration_parser(self) -> None:
         self.assertEqual(bazel_adaptive.parse_duration_seconds("Compiling x; 27s sandbox"), 27)
         self.assertEqual(bazel_adaptive.parse_duration_seconds("Compiling x; 27s remote"), 27)
